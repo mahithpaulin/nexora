@@ -98,6 +98,11 @@ def parse(data: Any) -> List[Dict[str, Any]]:
     grid = [[c.strip() for c in ln.split(",")] for ln in lines]
     if _is_header(grid[0]):
         header = [c.strip().lower() for c in grid[0]]
+        if len(header) == 1:
+            # Single column: header is just a name; rows are scalar values
+            # (so strings keep themselves as labels, numbers as values).
+            return normalize_observations(
+                [_coerce_cell(r[0]) if r else None for r in grid[1:]])
         dicts = []
         for row in grid[1:]:
             d: Dict[str, Any] = {}
