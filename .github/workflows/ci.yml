@@ -23,3 +23,5 @@ jobs:
         run: python examples/demo_phase2.py
       - name: Run 10-problem evaluation (must be 10/10)
         run: python examples/eval_10.py
+      - name: Run thorough evaluation (must be 30/30)
+        run: python examples/eval_thorough.py
