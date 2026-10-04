@@ -121,6 +121,22 @@ class PatternRepository:
         p = self._patterns.get(pid)
         return dict(p) if isinstance(p, dict) else p
 
+    def update(self, pid, patch):
+        """Merge patch dict into a stored pattern; returns True if found.
+
+        Used by the engine to persist lifecycle states, evolution flags,
+        and relationship maps without changing the pattern's identity
+        (signature, frequency, occurrences untouched unless in patch).
+        """
+        cur = self._patterns.get(pid)
+        if cur is None or not isinstance(patch, dict):
+            return False
+        for k, v in patch.items():
+            if k == "id":
+                continue
+            cur[k] = v
+        return True
+
     def all(self):
         return [dict(v) for v in self._patterns.values()]
 

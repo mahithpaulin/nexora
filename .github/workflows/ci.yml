@@ -19,3 +19,5 @@ jobs:
         run: python -m pytest tests/ -q
       - name: Run demo smoke test
         run: python examples/demo.py
+      - name: Run phase-2 demo smoke test
+        run: python examples/demo_phase2.py

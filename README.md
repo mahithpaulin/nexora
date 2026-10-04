@@ -29,3 +29,28 @@ Layers: `ingestion → preprocessing (observation) → features
 matching (distance/similarity/DTW) → memory (repository/lifecycle) →
 scoring → prediction (Markov/transitions) → explanation → API (Nexora)`.
 See `pyproject.toml` (`requires-python = >=3.10`, no dependencies).
+
+## Phase 2 — discovery & intelligence (v0.2-dev)
+
+New modules, still stdlib-only and deterministic:
+
+- `discovery/clustering.py` — k-means, DBSCAN, agglomerative on
+  windowed embeddings → `regime` patterns wired into `discover()`
+- `features/pca.py` — power-iteration PCA + projection + recon error
+- `features/correlation.py` — covariance/correlation matrices,
+  cross-correlation, `correlation` patterns from multi-field rows
+- `features/seasonality.py` — additive decomposition + autocorr period
+  estimation → `seasonal` patterns wired into `discover()`
+- `prediction/context.py` — variable-order Markov with backoff +
+  sequence log-loss; exposed as `predict()["context"]`
+- `anomaly/multivariate.py` — Mahalanobis detector, also run on
+  windowed 1-D series inside `find_anomalies()` (`kind="multivariate"`)
+- `memory/evolution.py` — snapshots, drift scores, trend tracking;
+  sustained drift flips patterns to `EVOLVING` (lifecycle now persists)
+- `memory/relationships.py` — `commonly_preceded_by/followed_by`
+  attached to sequential patterns on every `discover()`
+
+```bash
+python -m pytest tests/ -q
+python examples/demo_phase2.py
+```

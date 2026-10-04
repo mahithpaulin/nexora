@@ -33,6 +33,27 @@ except ImportError:
     sequence_similarity = pearson_similarity = cosine_similarity = None
     euclidean = normalized_similarity = dtw_distance = None
 try:
+    from nexora.discovery.clustering import find_regimes
+    from nexora.discovery.clustering import windows as _embed_windows
+    from nexora.features.correlation import find_correlation_patterns
+    from nexora.features.seasonality import decompose, estimate_period
+    from nexora.features.pca import pca as _pca
+    from nexora.prediction.context import (build_context_model,
+                                           predict_with_context,
+                                           sequence_log_loss)
+    from nexora.anomaly.multivariate import detect_multivariate
+    from nexora.memory.evolution import snapshot as _evo_snapshot
+    from nexora.memory.evolution import drift_score as _evo_drift
+    from nexora.memory.relationships import (attach_relationships,
+                                             build_relationships)
+except ImportError:
+    find_regimes = _embed_windows = None
+    find_correlation_patterns = decompose = estimate_period = None
+    _pca = build_context_model = predict_with_context = sequence_log_loss = None
+    detect_multivariate = None
+    _evo_snapshot = _evo_drift = None
+    build_relationships = attach_relationships = None
+try:
     from nexora.memory.repository import PatternRepository
     from nexora.memory.lifecycle import advance as _lc_advance
     from nexora.anomaly.detector import detect as _anomaly_detect
@@ -50,7 +71,44 @@ except ImportError:
         build_transition_matrix = predict_next = None
         explain_match = summarize_result = None
 
-DEFAULT_CONFIG = {"z_threshold": 3.0, "min_support": 3, "max_n": 3, "window": 20, "weights": {}}
+DEFAULT_CONFIG = {"z_threshold": 3.0, "min_support": 3, "max_n": 3, "window": 20, "weights": {},
+                  "regimes": True, "regime_size": 8, "n_clusters": 2,
+                  "correlation": True, "corr_threshold": 0.7,
+                  "seasonality": True, "context_order": 2,
+                  "multivariate": True, "mv_window": 5, "mv_threshold": 0.9,
+                  "evolve_drift": 0.4}
+
+
+def _numeric_columns(data):
+    """Collect numeric raw-dict fields into {key: [numbers/None]} columns.
+
+    Only list/tuple inputs whose items are dicts are considered; a key
+    is kept when it holds at least 2 valid (int/float, non-bool)
+    values. Missing/None preserved as None for pairwise deletion.
+    """
+    cols = {}
+    if not isinstance(data, (list, tuple)):
+        return {}
+    raws = [d for d in data if isinstance(d, dict)]
+    if not raws:
+        return {}
+    keys = set()
+    for d in raws:
+        keys.update(d.keys())
+    for k in sorted(keys, key=str):
+        col, valid = [], 0
+        for d in raws:
+            v = d.get(k)
+            if isinstance(v, bool):
+                col.append(None)
+            elif isinstance(v, (int, float)):
+                col.append(float(v))
+                valid += 1
+            else:
+                col.append(None)
+        if valid >= 2:
+            cols[str(k)] = col
+    return cols
 
 
 def _get(p, key, default=None):
@@ -119,7 +177,9 @@ class Nexora:
             raise ImportError("nexora.memory.repository is required")
         self.repo = PatternRepository()
         self._trail = {}
+        self._snaps = {}
         self._matrix = None
+        self._ctx = None
         self._lc_cfg = {"confirm_threshold": 3, "establish_freq": 10, "establish_confidence": 0.8,
                         "stale_after": 100, "retired_after": 200, "drift_threshold": 0.5}
 
@@ -128,7 +188,28 @@ class Nexora:
         stored = self.repo.get(pid)
         if _lc_advance is not None and isinstance(stored, dict):
             try:
-                _lc_advance(stored, True, self._lc_cfg)
+                new_state, _ = _lc_advance(dict(stored), True, self._lc_cfg)
+                if new_state != stored.get("state"):
+                    try:
+                        self.repo.update(pid, {"state": new_state})
+                    except Exception:
+                        pass
+                    stored["state"] = new_state
+            except Exception:
+                pass
+        if _evo_snapshot is not None and isinstance(stored, dict):
+            try:
+                new_snap = _evo_snapshot(stored)
+                old_snap = self._snaps.get(pid)
+                if old_snap is not None and _evo_drift is not None:
+                    d = _evo_drift(old_snap, new_snap)
+                    if d.get("score", 0.0) >= float(self.config.get("evolve_drift", 0.4)):
+                        try:
+                            self.repo.update(pid, {"state": "EVOLVING"})
+                        except Exception:
+                            pass
+                        stored["state"] = "EVOLVING"
+                self._snaps[pid] = new_snap
             except Exception:
                 pass
         c = stored.get("confidence", 0.5) if isinstance(stored, dict) else 0.5
@@ -200,8 +281,94 @@ class Nexora:
                          "last_seen": occ[-1] if occ else None, "occurrences": occ,
                          "confidence": min(1.0, 0.4 + 0.1 * sup),
                          "similarity": 1.0, "novelty": 0.0, "context": {}, "metadata": {}, "state": "NEW"})
+        nums = [v for v in values
+                if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if self.config.get("regimes", True) and find_regimes is not None and len(nums) >= 16:
+            try:
+                rsize = max(2, int(self.config.get("regime_size", 8)))
+                rk = max(2, int(self.config.get("n_clusters", 2)))
+                for rp in find_regimes(nums, size=rsize, k=rk) or []:
+                    feats = rp.get("features", {}) or {}
+                    occ = list(rp.get("occurrences", []) or [])
+                    cnt = int(feats.get("count", rp.get("frequency", 1)) or 1)
+                    self._store({"type": "regime",
+                                 "features": {"method": feats.get("method", "kmeans"),
+                                              "cluster": feats.get("cluster"),
+                                              "window": rsize, "count": cnt,
+                                              "support": feats.get("support", 0.0),
+                                              "centroid": [round(float(x), 4) for x in (feats.get("centroid") or [])]},
+                                 "sequence": [round(float(x), 4) for x in (rp.get("sequence") or [])],
+                                 "relationships": {}, "frequency": cnt,
+                                 "first_seen": occ[0] if occ else None,
+                                 "last_seen": occ[-1] if occ else None, "occurrences": occ,
+                                 "confidence": min(1.0, 0.4 + 0.1 * cnt),
+                                 "similarity": 1.0, "novelty": 0.0,
+                                 "context": {"stats": st}, "metadata": {}, "state": "NEW"})
+            except Exception:
+                pass
+        if self.config.get("correlation", True) and find_correlation_patterns is not None:
+            try:
+                cols = _numeric_columns(data)
+                if len(cols) >= 2:
+                    cps = find_correlation_patterns(cols, threshold=float(self.config.get("corr_threshold", 0.7))) or []
+                    for cp in cps:
+                        feats = cp.get("features", {}) or {}
+                        n = int(feats.get("n", cp.get("frequency", 0)) or 0)
+                        self._store({"type": "correlation",
+                                     "features": {"a": feats.get("a"), "b": feats.get("b"),
+                                                  "r": feats.get("r"), "strength": feats.get("strength"),
+                                                  "n": n},
+                                     "sequence": list(cp.get("sequence") or []),
+                                     "relationships": {}, "frequency": n,
+                                     "first_seen": None, "last_seen": None, "occurrences": [],
+                                     "confidence": min(1.0, abs(float(feats.get("r", 0.0) or 0.0))),
+                                     "similarity": 1.0, "novelty": 0.0,
+                                     "context": {}, "metadata": {}, "state": "NEW"})
+            except Exception:
+                pass
+        if self.config.get("seasonality", True) and estimate_period is not None and len(nums) >= 12:
+            try:
+                est = estimate_period(nums)
+                if est and est.get("period"):
+                    dec = decompose(nums, int(est["period"]))
+                    sig = []
+                    for i in range(int(est["period"])):
+                        v = dec["seasonal"][i]
+                        sig.append(round(float(v), 4) if v is not None else None)
+                    self._store({"type": "seasonal",
+                                 "features": {"period": int(est["period"]),
+                                              "seasonal_strength": dec.get("seasonal_strength", 0.0),
+                                              "trend_strength": dec.get("trend_strength", 0.0)},
+                                 "sequence": sig,
+                                 "relationships": {}, "frequency": 1,
+                                 "first_seen": None, "last_seen": None, "occurrences": [],
+                                 "confidence": float(dec.get("seasonal_strength", 0.0)),
+                                 "similarity": 1.0, "novelty": 0.0,
+                                 "context": {}, "metadata": {}, "state": "NEW"})
+            except Exception:
+                pass
+        if build_relationships is not None:
+            try:
+                current = self.repo.all()
+                seq_pats = [p for p in current
+                            if p.get("type") in ("sequential", "frequent_sequence") and p.get("sequence")]
+                if seq_pats:
+                    rels = build_relationships(labels, seq_pats)
+                    attached = attach_relationships([dict(p) for p in seq_pats], rels)
+                    for p in attached:
+                        try:
+                            self.repo.update(p["id"], {"relationships": p.get("relationships", {})})
+                        except Exception:
+                            pass
+            except Exception:
+                pass
         pats = self.repo.all()
-        expl = "Discovered %d pattern(s) from %d observation(s) (mean %.3f)." % (len(pats), len(rows), st.get("mean", 0.0))
+        _mean = st.get("mean", 0.0)
+        try:
+            _mean = float(_mean)
+        except (TypeError, ValueError):
+            _mean = 0.0
+        expl = "Discovered %d pattern(s) from %d observation(s) (mean %.3f)." % (len(pats), len(rows), _mean)
         return {"patterns": pats, "count": len(pats), "reason": expl, "explanation": expl, "evidence": {"stats": st}}
 
     def match(self, observation):
@@ -234,11 +401,42 @@ class Nexora:
             out = [{"index": r["index"], "value": r["value"], "kind": "statistical", "score": 0.9,
                     "causes": ["z-threshold"], "explanation": "outlier"} for r in rows
                    if isinstance(r["value"], (int, float)) and st["stdev"] > 0 and abs((r["value"] - st["mean"]) / st["stdev"]) >= zt]
+        if self.config.get("multivariate", True) and detect_multivariate is not None and _embed_windows is not None:
+            try:
+                pairs = [(r["index"], r["value"]) for r in rows
+                         if isinstance(r.get("value"), (int, float)) and not isinstance(r.get("value"), bool)]
+                msize = max(2, int(self.config.get("mv_window", 5)))
+                if len(pairs) >= 2 * msize:
+                    wvecs, wstarts = _embed_windows([v for _, v in pairs], msize)
+                    if wvecs:
+                        mv = detect_multivariate(wvecs, threshold=float(self.config.get("mv_threshold", 0.9)))
+                        for a in mv.get("anomalies", []):
+                            ri = pairs[wstarts[a["index"]]][0]
+                            rv = pairs[wstarts[a["index"]]][1]
+                            dims = mv.get("dims", msize)
+                            out.append({
+                                "index": ri, "value": rv, "z": 0.0, "score": a["score"],
+                                "kind": "multivariate",
+                                "causes": ["window d2=%.2f over %d dims" % (a["d2"], dims)],
+                                "explanation": ("Multivariate outlier at window starting index %s: "
+                                                "Mahalanobis d2=%.2f across %d dims, score %.2f "
+                                                "(threshold %s)." % (ri, a["d2"], dims, a["score"],
+                                                                      self.config.get("mv_threshold", 0.9))),
+                            })
+            except Exception:
+                pass
+        out.sort(key=lambda d: (d.get("index", 0), d.get("kind", "")))
         expl = "Found %d anomalie(s) (z_threshold=%s)." % (len(out), zt)
         return {"anomalies": out, "count": len(out), "reason": expl, "explanation": expl, "evidence": {"stats": st}}
 
     def predict(self, data, current=None):
-        """P(next|current) from bigram counts; evidence cites observed counts."""
+        """P(next|current) from bigram counts + backoff context model.
+
+        predictions: first-order Markov (stable v0.1 field). context:
+        variable-order backoff predictions with the order actually used.
+        log_loss: mean base-2 NLL of the data under the context model
+        (lower = more predictable; None when not computable).
+        """
         labels = [r["label"] for r in _rows(data)]
         if build_transition_matrix is not None:
             self._matrix = build_transition_matrix(labels)
@@ -246,9 +444,25 @@ class Nexora:
             preds = predict_next(cur, self._matrix, top_k=3) if cur is not None else []
         else:
             cur, preds = current, []
+        ctx_preds, log_loss = [], None
+        if build_context_model is not None and labels:
+            try:
+                mo = max(0, int(self.config.get("context_order", 2)))
+                clean = [l for l in labels if l is not None]
+                self._ctx = build_context_model(clean, mo)
+                tail = clean[-mo:] if mo > 0 else []
+                ctx_preds = predict_with_context(self._ctx, tail, top_k=3) or []
+                if sequence_log_loss is not None:
+                    try:
+                        log_loss = sequence_log_loss(self._ctx, clean)
+                    except Exception:
+                        log_loss = None
+            except Exception:
+                pass
         expl = "Predicted %d candidate(s) after '%s'." % (len(preds), cur)
         states = (self._matrix or {}).get("states", [])
-        return {"current": cur, "predictions": preds, "reason": expl, "explanation": expl, "evidence": {"matrix_states": states}}
+        return {"current": cur, "predictions": preds, "context": ctx_preds, "log_loss": log_loss,
+                "reason": expl, "explanation": expl, "evidence": {"matrix_states": states}}
 
     def get_pattern(self, pid):
         """Return one stored pattern dict (or None)."""
