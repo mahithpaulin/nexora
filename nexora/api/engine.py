@@ -5,7 +5,13 @@ All sibling discovery/feature/matching imports are guarded
 stdlib logic when a module is missing.
 """
 import collections
+import os
 import statistics
+
+try:
+    from nexora.ingestion.parser import parse as _parse_path
+except ImportError:
+    _parse_path = None
 
 try:
     from nexora.core.observation import normalize_observations, validate_observations
@@ -140,7 +146,21 @@ def _get(p, key, default=None):
     return p.get(key, default) if isinstance(p, dict) else getattr(p, key, default)
 
 
+def _is_file_path(data):
+    return isinstance(data, str) and os.path.exists(data) and os.path.isfile(data)
+
+
 def _rows(data):
+    if isinstance(data, os.PathLike) and _parse_path is not None:
+        r = _parse_path(data)  # FileNotFoundError propagates: explicit path must exist
+        return list(r)
+    if _is_file_path(data) and _parse_path is not None:
+        try:
+            r = _parse_path(data)
+            if r:
+                return list(r)
+        except Exception:
+            pass
     if normalize_observations is not None:
         try:
             r = normalize_observations(data)
@@ -518,12 +538,16 @@ class Nexora:
         return str(result)
 
     def quality(self, data):
-        """Data-quality report for raw input (never raises on ordinary data).
+        """Data-quality report: raw lists, or a file path (parsed, then raw values assessed).
 
-        Raises TypeError for non-list/tuple/None input (programmer error).
+        Never raises on ordinary data. Raises TypeError for non-list /
+        non-path input, FileNotFoundError for a missing PathLike.
         """
         if _quality_report is None:
             raise ImportError("nexora.ingestion.quality is required")
+        if isinstance(data, os.PathLike) or _is_file_path(data):
+            rows = _rows(data)
+            return _quality_report([r.get("raw") for r in rows])
         return _quality_report(data)
 
     def report(self, result, fmt="markdown"):
