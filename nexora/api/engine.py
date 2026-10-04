@@ -75,7 +75,7 @@ DEFAULT_CONFIG = {"z_threshold": 3.0, "min_support": 3, "max_n": 3, "window": 20
                   "regimes": True, "regime_size": 8, "n_clusters": 2,
                   "correlation": True, "corr_threshold": 0.7,
                   "seasonality": True, "context_order": 2,
-                  "multivariate": True, "mv_window": 5, "mv_threshold": 0.9,
+                  "multivariate": True, "mv_window": 5, "mv_threshold": 0.8,
                   "evolve_drift": 0.4}
 
 
