@@ -21,3 +21,5 @@ jobs:
         run: python examples/demo.py
       - name: Run phase-2 demo smoke test
         run: python examples/demo_phase2.py
+      - name: Run 10-problem evaluation (must be 10/10)
+        run: python examples/eval_10.py
