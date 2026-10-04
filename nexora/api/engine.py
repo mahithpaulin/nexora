@@ -54,6 +54,31 @@ except ImportError:
     _evo_snapshot = _evo_drift = None
     build_relationships = attach_relationships = None
 try:
+    from nexora.ingestion.quality import quality_report as _quality_report
+except ImportError:
+    _quality_report = None
+try:
+    from nexora.core.config import validate_config as _validate_config
+except ImportError:
+    _validate_config = None
+try:
+    from nexora.memory.store import (load_engine_state as _load_state,
+                                     save_engine_state as _save_state)
+except ImportError:
+    _load_state = _save_state = None
+try:
+    from nexora.explanation.report import (pattern_card as _pattern_card,
+                                           render_markdown as _render_markdown,
+                                           render_text as _render_text)
+except ImportError:
+    _pattern_card = _render_markdown = _render_text = None
+try:
+    from nexora.api.batch import batch_process as _batch_process
+    from nexora.api.batch import compare_signatures as _compare_sigs
+    from nexora.api.batch import summarize_batch as _summarize_batch
+except ImportError:
+    _batch_process = _compare_sigs = _summarize_batch = None
+try:
     from nexora.memory.repository import PatternRepository
     from nexora.memory.lifecycle import advance as _lc_advance
     from nexora.anomaly.detector import detect as _anomaly_detect
@@ -167,12 +192,17 @@ def _sim(row, pattern):
 
 class Nexora:
     """Stable public API: detect, discover, match, find_anomalies, predict,
-    get_pattern, get_history, explain. Internal algorithms may change."""
+    get_pattern, get_history, explain + quality, report, save, load, batch.
+    Internal algorithms may change. Config is validated fail-fast
+    (InvalidConfigError, a ValueError) when nexora.core.config exists."""
 
     def __init__(self, config=None):
-        self.config = dict(DEFAULT_CONFIG)
-        if config:
-            self.config.update(config)
+        if _validate_config is not None:
+            self.config = _validate_config(config)
+        else:
+            self.config = dict(DEFAULT_CONFIG)
+            if config:
+                self.config.update(config)
         if PatternRepository is None:
             raise ImportError("nexora.memory.repository is required")
         self.repo = PatternRepository()
@@ -486,3 +516,70 @@ class Nexora:
             except Exception:
                 pass
         return str(result)
+
+    def quality(self, data):
+        """Data-quality report for raw input (never raises on ordinary data).
+
+        Raises TypeError for non-list/tuple/None input (programmer error).
+        """
+        if _quality_report is None:
+            raise ImportError("nexora.ingestion.quality is required")
+        return _quality_report(data)
+
+    def report(self, result, fmt="markdown"):
+        """Full human-readable report: fmt="markdown" (default) or "text".
+
+        Never raises on malformed results (coerces with placeholders).
+        """
+        if fmt == "text":
+            if _render_text is None:
+                raise ImportError("nexora.explanation.report is required")
+            return _render_text(result)
+        if _render_markdown is None:
+            raise ImportError("nexora.explanation.report is required")
+        return _render_markdown(result)
+
+    def save(self, path):
+        """Persist engine state (config, patterns, trails) to path (atomic write).
+
+        Returns path. Raises ImportError if store module missing, OSError
+        on real IO failures.
+        """
+        if _save_state is None:
+            raise ImportError("nexora.memory.store is required")
+        return _save_state(path, self.repo, trails=self._trail, config=self.config)
+
+    def load(self, path):
+        """Load state saved by save(); replaces memory, trails, config.
+
+        Returns {"patterns", "version", "reason"}. Raises
+        FileNotFoundError/ValueError on bad files (fail-fast, documented).
+        """
+        if _load_state is None:
+            raise ImportError("nexora.memory.store is required")
+        st = _load_state(path)
+        fresh = PatternRepository()
+        fresh.import_patterns(st.get("patterns", []))
+        self.repo = fresh
+        trails = st.get("trails", {})
+        self._trail = {str(k): list(v) for k, v in trails.items()} if isinstance(trails, dict) else {}
+        self._snaps = {}
+        cfg = st.get("config", {})
+        if cfg and _validate_config is not None:
+            try:
+                self.config = _validate_config(cfg)
+            except Exception:
+                pass
+        return {"patterns": self.repo.size(), "version": st.get("version"),
+                "reason": "Loaded %d pattern(s) (schema v%s)." % (self.repo.size(), st.get("version"))}
+
+    def batch(self, datasets):
+        """Isolated detect() per dataset (fresh engine each); returns outcomes.
+
+        One bad dataset records {"error": ...} and never kills the batch.
+        See nexora.api.batch.summarize_batch / compare_signatures for
+        rollups and diffs.
+        """
+        if _batch_process is None:
+            raise ImportError("nexora.api.batch is required")
+        return _batch_process(datasets, self.config)

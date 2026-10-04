@@ -146,6 +146,56 @@ class PatternRepository:
     def size(self):
         return len(self._patterns)
 
+    def import_patterns(self, patterns):
+        """Insert pattern dicts preserving ids; counter follows max id.
+
+        Skips entries without an id. Rebuilds the signature map.
+        Returns the number inserted.
+        """
+        n = 0
+        for p in patterns or []:
+            if not isinstance(p, dict) or p.get("id") is None:
+                continue
+            pid = str(p["id"])
+            self._patterns[pid] = dict(p)
+            try:
+                self._sig_to_id[signature_of(p)] = pid
+            except Exception:
+                pass
+            n += 1
+        mx = 0
+        for pid in self._patterns:
+            try:
+                mx = max(mx, int(str(pid).split("-")[1]))
+            except (ValueError, IndexError):
+                pass
+        self._counter = max(self._counter, mx + 1)
+        return n
+
+    def prune(self, max_total=1000, drop_states=("RETIRED",)):
+        """Drop oldest-first patterns in drop_states while size > max_total.
+
+        Ordering is deterministic: unknown last_seen sorts first, then by
+        id string. Returns the removed ids. No-op when size <= max_total.
+        """
+        if self.size() <= max_total:
+            return []
+        drop = set(drop_states or ())
+        cand = [p for p in self._patterns.values() if p.get("state") in drop]
+        cand.sort(key=lambda p: (0 if p.get("last_seen") is None else 1,
+                                 str(p.get("last_seen")),
+                                 str(p.get("id"))))
+        removed = []
+        while self.size() > max_total and cand:
+            pid = cand.pop(0)["id"]
+            if pid in self._patterns:
+                del self._patterns[pid]
+            for sig, mapped in list(self._sig_to_id.items()):
+                if mapped == pid:
+                    del self._sig_to_id[sig]
+            removed.append(pid)
+        return removed
+
     def save(self, path):
         parent = os.path.dirname(os.path.abspath(path))
         if parent and not os.path.exists(parent):

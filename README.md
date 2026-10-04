@@ -1,4 +1,30 @@
-# Nexora
+# Nexora v1.0.0 — non-neural pattern-recognition engine
+
+Stdlib-only Python. No neural networks, no numpy, no GPU. Every result
+carries a human-readable explanation with cited numbers.
+
+```python
+from nexora import Nexora
+nx = Nexora()
+print(nx.discover(list("ABCABCABC"))["explanation"])
+print(nx.predict(list("ABCABCABC"))["predictions"])
+print(nx.find_anomalies([10.0] * 30 + [25.0])["anomalies"])
+print(nx.report(nx.detect(list("ABCABC"))))  # markdown report
+nx.save("state.json"); nx.load("state.json")  # persistence
+```
+
+```bash
+pip install -e .          # or just run from the repo root (stdlib only)
+python -m pytest tests/ -q
+python examples/demo.py           # core story
+python examples/demo_phase2.py    # regimes, correlation, seasonality
+```
+
+API: `detect/discover/match/find_anomalies/predict/get_pattern/
+get_history/explain` + `quality/report/save/load/batch`.
+Config is validated fail-fast (`InvalidConfigError`, a `ValueError`).
+Details: `pyproject.toml` (`requires-python = >=3.10`, no dependencies).
+License: MIT (see `LICENSE`).
 
 Opencode bot enabled — comment `/oc` or `/opencode` on any issue or PR to
 get AI help (code, review, research). Runs on GitHub Actions with a free
