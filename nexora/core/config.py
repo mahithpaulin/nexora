@@ -31,6 +31,7 @@ DEFAULTS = {
     "mv_window": 5,
     "mv_threshold": 0.8,
     "evolve_drift": 0.4,
+    "max_period": 256,
 }
 SCHEMA = {
     "z_threshold": ((float, int), 0.1, 10),
@@ -49,6 +50,7 @@ SCHEMA = {
     "mv_window": (int, 2, 10**4),
     "mv_threshold": ((float, int), 0, 1),
     "evolve_drift": ((float, int), 0, 1),
+    "max_period": (int, 2, 10**6),
 }
 KEY_DOCS = {
     "z_threshold": "Z-score cutoff for flagging anomalies, range [0.1, 10].",
@@ -67,6 +69,7 @@ KEY_DOCS = {
     "mv_window": "Multivariate window length, range [2, 10000].",
     "mv_threshold": "Multivariate agreement threshold, range [0, 1].",
     "evolve_drift": "Allowed drift per evolve step, range [0, 1].",
+    "max_period": "Maximum seasonal period examined, range [2, 1000000].",
 }
 def validate_config(d=None):
     """Validate a config dict and return a fresh validated dict.
@@ -75,7 +78,8 @@ def validate_config(d=None):
     window [1, 1000000]; weights dict; regimes/correlation/seasonality/
     multivariate bool (exact type, int rejected); regime_size [2, 10000];
     n_clusters [1, 1000]; corr_threshold/mv_threshold/evolve_drift [0, 1];
-    context_order [0, 10]; mv_window [2, 10000]. Bounds are inclusive.
+    context_order [0, 10]; mv_window [2, 10000]; max_period [2, 1000000].
+    Bounds are inclusive.
     Starts from DEFAULTS, overlays known keys of ``d``; unknown keys are
     ignored silently. Int fields accept lossless int-valued floats
     (3.0 -> 3) else raise; float fields accept int (coerced to float) and

@@ -64,6 +64,12 @@ try:
 except ImportError:
     _analyze_seq = None
 try:
+    from nexora.features.structural import (cooccurrence_graph as _co_graph,
+                                            connected_components as _co_comps,
+                                            association_rules as _assoc_rules)
+except ImportError:
+    _co_graph = _co_comps = _assoc_rules = None
+try:
     from nexora.ingestion.quality import quality_report as _quality_report
 except ImportError:
     _quality_report = None
@@ -111,7 +117,7 @@ DEFAULT_CONFIG = {"z_threshold": 3.0, "min_support": 3, "max_n": 3, "window": 20
                   "correlation": True, "corr_threshold": 0.7,
                   "seasonality": True, "context_order": 2,
                   "multivariate": True, "mv_window": 5, "mv_threshold": 0.8,
-                  "evolve_drift": 0.4}
+                  "evolve_drift": 0.4, "max_period": 256}
 
 
 def _numeric_columns(data):
@@ -163,8 +169,9 @@ def _rows(data):
             r = _parse_path(data)
             if r:
                 return list(r)
+            return []
         except Exception:
-            pass
+            return []
     if normalize_observations is not None:
         try:
             r = normalize_observations(data)
@@ -197,21 +204,113 @@ def _stats(values):
 
 
 def _sim(row, pattern):
-    """Similarity 0..1 of one row vs one pattern (sequence-based, deterministic)."""
-    seq = [str(x) for x in (_get(pattern, "sequence", []) or [])]
-    lab = str(row.get("label", row.get("value", "")))
+    """Similarity 0..1 of one row vs one pattern (sequence + numeric, deterministic).
+
+    v1 categorical path runs first and is unchanged: sequence_similarity on
+    str-normalized [label] vs str-normalized sequence, then exact value
+    match (1.0), then membership (0.8), else 0.0. v2 adds a numeric
+    distance-to-centroid-mean path for regime/seasonal patterns (or any
+    pattern with a centroid / numeric sequence) when the row value is
+    numeric: d = euclidean([v], [mean]) mapped via
+    normalized_similarity(d, scale) with scale from pattern features when
+    present else 1.0. Returns max(sequence_score, numeric_score).
+    """
+    try:
+        seq = [str(x) for x in (_get(pattern, "sequence", []) or [])]
+    except Exception:
+        seq = []
+    try:
+        lab = str(row.get("label", row.get("value", "")))
+    except Exception:
+        lab = ""
+    try:
+        row_val_s = str(row.get("value", ""))
+    except Exception:
+        row_val_s = ""
+    feats = _get(pattern, "features", {}) or {}
+    if not isinstance(feats, dict):
+        feats = {}
+    seq_score, seq_reason, seq_ran = 0.0, "no sequence", False
     if sequence_similarity is not None and seq:
         try:
-            score, _reason = sequence_similarity([lab], seq)
-            return max(0.0, min(1.0, float(score)))
+            _s, _r = sequence_similarity([lab], seq)
+            seq_score = max(0.0, min(1.0, float(_s)))
+            seq_reason = str(_r)
+            seq_ran = True
         except Exception:
-            pass
-    feats = _get(pattern, "features", {}) or {}
-    if row.get("value") == feats.get("value"):
-        return 1.0
-    if lab in seq or str(row.get("value", "")) in seq:
-        return 0.8
-    return 0.0
+            seq_ran = False
+    if seq_ran:
+        base = seq_score
+    elif row.get("value") == feats.get("value"):
+        base, seq_reason = 1.0, "exact value match"
+    elif lab in seq or row_val_s in seq:
+        base, seq_reason = 0.8, "label/value in sequence"
+    else:
+        base, seq_reason = 0.0, "no match"
+    num_score, num_reason = 0.0, "n/a"
+    try:
+        v = row.get("value")
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError("non-numeric row")
+        if isinstance(v, float) and v != v:
+            raise ValueError("NaN row")
+        fv = float(v)
+        ptype = _get(pattern, "type", "")
+        cent = feats.get("centroid")
+        cent_nums = []
+        if isinstance(cent, (list, tuple)):
+            for _x in cent:
+                if isinstance(_x, bool):
+                    continue
+                if isinstance(_x, (int, float)) and _x == _x:
+                    cent_nums.append(float(_x))
+        seq_nums = []
+        for _x in (_get(pattern, "sequence", []) or []):
+            if isinstance(_x, bool):
+                continue
+            if isinstance(_x, (int, float)) and _x == _x:
+                seq_nums.append(float(_x))
+            else:
+                try:
+                    seq_nums.append(float(str(_x)))
+                except (TypeError, ValueError):
+                    continue
+        if ptype in ("regime", "seasonal") or cent_nums or seq_nums:
+            ref_vals = cent_nums if cent_nums else seq_nums
+            if not ref_vals:
+                raise ValueError("no numeric reference")
+            try:
+                ref = float(statistics.fmean(ref_vals))
+            except Exception:
+                ref = sum(ref_vals) / len(ref_vals)
+            scale = 1.0
+            for _k in ("stdev", "std", "stddev", "scale", "spread"):
+                try:
+                    if feats.get(_k) is not None:
+                        scale = float(feats.get(_k))
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if not (isinstance(scale, float) and scale > 0):
+                scale = 1.0
+            try:
+                d = float(euclidean([fv], [ref])) if euclidean is not None else abs(fv - ref)
+            except Exception:
+                d = abs(fv - ref)
+            try:
+                if normalized_similarity is not None:
+                    num_score = max(0.0, min(1.0, float(normalized_similarity(d, scale=scale))))
+                else:
+                    num_score = 1.0 / (1.0 + d / scale)
+            except Exception:
+                num_score = 0.0
+            num_reason = "d=%.4f scale=%.4f" % (d, scale)
+    except Exception:
+        num_score = 0.0
+    try:
+        return max(0.0, min(1.0, float(max(base, num_score))))
+    except Exception:
+        return base
 
 
 class Nexora:
@@ -266,6 +365,97 @@ class Nexora:
                 self._snaps[pid] = new_snap
             except Exception:
                 pass
+        if self.config.get("scoring", True) and score_pattern is not None and isinstance(stored, dict):
+            try:
+                try:
+                    old_c = float(stored.get("confidence", 0.5))
+                except (TypeError, ValueError):
+                    old_c = 0.5
+                old_c = max(0.0, min(1.0, old_c))
+                try:
+                    freq = stored.get("frequency", 1)
+                except Exception:
+                    freq = 1
+                try:
+                    _total = 0
+                    for _p in self.repo.all():
+                        try:
+                            _total += int(_p.get("frequency", 1) or 1)
+                        except (TypeError, ValueError):
+                            _total += 1
+                    total_n = max(1, _total)
+                except Exception:
+                    total_n = 1
+                try:
+                    _nov = float(stored.get("novelty", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    _nov = 0.0
+                consistency = 1.0 - max(0.0, min(1.0, _nov))
+                try:
+                    sim_v = float(stored.get("similarity", 1.0))
+                except (TypeError, ValueError):
+                    sim_v = 1.0
+                try:
+                    _max_last, _mine = None, stored.get("last_seen")
+                    for _q in self.repo.all():
+                        _ls = _q.get("last_seen")
+                        if _ls is None:
+                            continue
+                        try:
+                            if _max_last is None or _ls > _max_last:
+                                _max_last = _ls
+                        except TypeError:
+                            continue
+                    recency = 1.0 if (_mine is not None and _mine == _max_last) else 0.5
+                except Exception:
+                    recency = 0.5
+                try:
+                    rels = stored.get("relationships", {}) or {}
+                    pred_s = 0.0
+                    _vals = list(rels.values()) if isinstance(rels, dict) else list(rels)
+                    for _rv in _vals:
+                        try:
+                            if isinstance(_rv, dict):
+                                for _k in ("probability", "prob", "confidence", "strength", "score"):
+                                    if _rv.get(_k) is not None:
+                                        pred_s = max(pred_s, max(0.0, min(1.0, float(_rv[_k]))))
+                            elif isinstance(_rv, (list, tuple)):
+                                for _e in _rv:
+                                    if isinstance(_e, dict):
+                                        _e = _e.get("probability", 0.0)
+                                    pred_s = max(pred_s, max(0.0, min(1.0, float(_e))))
+                            elif isinstance(_rv, (int, float)) and not isinstance(_rv, bool):
+                                pred_s = max(pred_s, max(0.0, min(1.0, float(_rv))))
+                        except (TypeError, ValueError):
+                            continue
+                except Exception:
+                    pred_s = 0.0
+                _unc = max(0.0, min(1.0, 1.0 - old_c))
+                try:
+                    _w = self.config.get("weights", {})
+                except Exception:
+                    _w = {}
+                if not isinstance(_w, dict):
+                    _w = {}
+                res = score_pattern(frequency=freq, total_n=total_n, consistency=consistency,
+                                    similarity=sim_v, recency=recency, predictive_strength=pred_s,
+                                    noise=0.0, uncertainty=_unc, weights=_w)
+                try:
+                    scored_c = max(0.0, min(1.0, float(res.get("confidence", old_c))))
+                except (TypeError, ValueError):
+                    scored_c = old_c
+                blended = 0.5 * old_c + 0.5 * scored_c
+                detail = dict(res) if isinstance(res, dict) else {"confidence": scored_c}
+                detail["blended_from"] = old_c
+                detail["total_n"] = total_n
+                try:
+                    self.repo.update(pid, {"confidence": blended, "score_detail": detail})
+                except Exception:
+                    pass
+                stored["confidence"] = blended
+                stored["score_detail"] = detail
+            except Exception:
+                pass
         c = stored.get("confidence", 0.5) if isinstance(stored, dict) else 0.5
         self._trail.setdefault(pid, []).append(c)
         return pid
@@ -277,6 +467,11 @@ class Nexora:
         labels = [r["label"] for r in rows]
         st = _stats(values)
         min_sup = int(self.config.get("min_support", 3))
+        try:
+            ids_before = set(str(_p.get("id")) for _p in self.repo.all() if isinstance(_p, dict))
+        except Exception:
+            ids_before = set()
+        _structural_ev = {}
         found = []
         if find_recurring_values is not None:
             try:
@@ -380,9 +575,17 @@ class Nexora:
                                      "context": {}, "metadata": {}, "state": "NEW"})
             except Exception:
                 pass
+        try:
+            _mp_cfg = max(2, int(self.config.get("max_period", 256)))
+        except (TypeError, ValueError):
+            _mp_cfg = 256
         if self.config.get("seasonality", True) and estimate_period is not None and len(nums) >= 12:
             try:
-                est = estimate_period(nums)
+                _mp_eff = min(max(2, len(nums) // 2), _mp_cfg)
+                try:
+                    est = estimate_period(nums, max_period=_mp_eff)
+                except TypeError:
+                    est = estimate_period(nums)
                 if est and est.get("period"):
                     dec = decompose(nums, int(est["period"]))
                     sig = []
@@ -434,6 +637,49 @@ class Nexora:
                             pass
             except Exception:
                 pass
+        if self.config.get("structural", True):
+            try:
+                _g = _co_graph(labels, window=2) if _co_graph is not None else None
+                _comps = _co_comps(_g) if (_co_comps is not None and isinstance(_g, dict)) else []
+                try:
+                    _nn = len(_g.get("nodes", [])) if isinstance(_g, dict) else 0
+                    _ne = len(_g.get("edges", {})) if isinstance(_g, dict) else 0
+                    _nc = len(_comps) if isinstance(_comps, list) else 0
+                except Exception:
+                    _nn, _ne, _nc = 0, 0, 0
+                _structural_ev = {"nodes": _nn, "edges": _ne, "components": _nc}
+                if _assoc_rules is not None and len(labels) >= 3:
+                    try:
+                        _txns = [list(labels[_i:_i + 3]) for _i in range(0, len(labels) - 2, 3)]
+                        _txns = [_t for _t in _txns if len(_t) == 3]
+                    except Exception:
+                        _txns = []
+                    try:
+                        _rules = _assoc_rules(_txns, min_support=min_sup, min_confidence=0.5) if _txns else []
+                    except Exception:
+                        _rules = []
+                    for _rl in (_rules or []):
+                        try:
+                            _ant, _con = _rl.get("antecedent"), _rl.get("consequent")
+                            _sup = float(_rl.get("support", 0.0) or 0.0)
+                            _cnf = float(_rl.get("confidence", 0.0) or 0.0)
+                            try:
+                                _cnt = int(_rl.get("count", min_sup) or min_sup)
+                            except (TypeError, ValueError):
+                                _cnt = min_sup
+                            self._store({"type": "association",
+                                         "features": {"antecedent": _ant, "consequent": _con,
+                                                      "support": _sup, "confidence": _cnf},
+                                         "sequence": [_ant, _con],
+                                         "relationships": {}, "frequency": _cnt,
+                                         "first_seen": None, "last_seen": None, "occurrences": [],
+                                         "confidence": max(0.0, min(1.0, _cnf)),
+                                         "similarity": 1.0, "novelty": 0.0,
+                                         "context": {}, "metadata": {}, "state": "NEW"})
+                        except Exception:
+                            continue
+            except Exception:
+                pass
         pats = self.repo.all()
         _mean = st.get("mean", 0.0)
         try:
@@ -441,7 +687,41 @@ class Nexora:
         except (TypeError, ValueError):
             _mean = 0.0
         expl = "Discovered %d pattern(s) from %d observation(s) (mean %.3f)." % (len(pats), len(rows), _mean)
-        return {"patterns": pats, "count": len(pats), "reason": expl, "explanation": expl, "evidence": {"stats": st}}
+        try:
+            new_pats = [dict(_p) for _p in pats if str(_p.get("id")) not in ids_before]
+        except Exception:
+            new_pats = []
+        try:
+            new_pats.sort(key=lambda _d: str(_d.get("id")))
+        except Exception:
+            pass
+        try:
+            try:
+                _ncols = len(_numeric_columns(data))
+            except Exception:
+                _ncols = 0
+            skipped = {}
+            if len(nums) < 16:
+                skipped["regimes"] = "skipped: need >= 16 numeric values, got %d." % len(nums)
+            elif not self.config.get("regimes", True):
+                skipped["regimes"] = "skipped: disabled via config regimes=False."
+            if len(nums) < 12:
+                skipped["seasonality"] = "skipped: need >= 12 numeric values, got %d." % len(nums)
+            elif not self.config.get("seasonality", True):
+                skipped["seasonality"] = "skipped: disabled via config seasonality=False."
+            if _ncols < 2:
+                skipped["correlation"] = "skipped: need >= 2 numeric columns, got %d." % _ncols
+            elif not self.config.get("correlation", True):
+                skipped["correlation"] = "skipped: disabled via config correlation=False."
+            skipped["multivariate"] = "n/a in discover (see find_anomalies; needs >= 2*mv_window numeric points)."
+        except Exception:
+            skipped = {"multivariate": "n/a in discover (see find_anomalies)."}
+        try:
+            ev = {"stats": st, "structural": dict(_structural_ev), "skipped": dict(skipped)}
+        except Exception:
+            ev = {"stats": st, "skipped": {"multivariate": "n/a in discover (see find_anomalies)."}}
+        return {"patterns": pats, "count": len(pats), "reason": expl, "explanation": expl,
+                "evidence": ev, "new_patterns": new_pats}
 
     def match(self, observation):
         """Rank all stored patterns by similarity to one observation."""
@@ -483,17 +763,25 @@ class Nexora:
                     if wvecs:
                         mv = detect_multivariate(wvecs, threshold=float(self.config.get("mv_threshold", 0.9)))
                         for a in mv.get("anomalies", []):
-                            ri = pairs[wstarts[a["index"]]][0]
-                            rv = pairs[wstarts[a["index"]]][1]
+                            try:
+                                _ei = wstarts[a["index"]] + msize - 1
+                                _ei = max(0, min(_ei, len(pairs) - 1))
+                            except Exception:
+                                try:
+                                    _ei = wstarts[a["index"]]
+                                except Exception:
+                                    continue
+                            ri = pairs[_ei][0]
+                            rv = pairs[_ei][1]
                             dims = mv.get("dims", msize)
                             out.append({
                                 "index": ri, "value": rv, "z": 0.0, "score": a["score"],
                                 "kind": "multivariate",
                                 "causes": ["window d2=%.2f over %d dims" % (a["d2"], dims)],
-                                "explanation": ("Multivariate outlier at window starting index %s: "
+                                "explanation": ("Multivariate outlier at window ending index %s: "
                                                 "Mahalanobis d2=%.2f across %d dims, score %.2f "
                                                 "(threshold %s)." % (ri, a["d2"], dims, a["score"],
-                                                                      self.config.get("mv_threshold", 0.9))),
+                                                                      self.config.get("mv_threshold", 0.8))),
                             })
             except Exception:
                 pass
@@ -510,9 +798,28 @@ class Nexora:
         (lower = more predictable; None when not computable).
         """
         labels = [r["label"] for r in _rows(data)]
+        try:
+            import math as _pmath
+        except ImportError:
+            _pmath = None
+
+        def _keep_lab(_l):
+            try:
+                if _l is None:
+                    return False
+                if isinstance(_l, float) and _l != _l:
+                    return False
+                return True
+            except Exception:
+                return False
+
+        try:
+            mlabels = [_l for _l in labels if _keep_lab(_l)]
+        except Exception:
+            mlabels = list(labels)
         if build_transition_matrix is not None:
-            self._matrix = build_transition_matrix(labels)
-            cur = current if current is not None else (labels[-1] if labels else None)
+            self._matrix = build_transition_matrix(mlabels)
+            cur = current if current is not None else (mlabels[-1] if mlabels else None)
             preds = predict_next(cur, self._matrix, top_k=3) if cur is not None else []
         else:
             cur, preds = current, []
@@ -520,7 +827,7 @@ class Nexora:
         if build_context_model is not None and labels:
             try:
                 mo = max(0, int(self.config.get("context_order", 2)))
-                clean = [l for l in labels if l is not None]
+                clean = [_l for _l in labels if _keep_lab(_l)]
                 self._ctx = build_context_model(clean, mo)
                 tail = clean[-mo:] if mo > 0 else []
                 ctx_preds = predict_with_context(self._ctx, tail, top_k=3) or []
@@ -542,9 +849,99 @@ class Nexora:
                     extrap = _analyze_seq(vals, steps=3)
             except Exception:
                 extrap = {}
+        if not isinstance(extrap, dict):
+            extrap = {}
+        try:
+            _tvals = list(vals)
+        except Exception:
+            _tvals = []
+        if self.config.get("trend_forecast", True) and detect_trend is not None:
+            try:
+                if len(_tvals) >= 3:
+                    _tr = detect_trend(_tvals)
+                    _slope = float(_tr.get("slope", 0.0) or 0.0)
+                    _dir = str(_tr.get("direction", "flat"))
+                    _last = float(_tvals[-1])
+                    extrap["trend"] = {"source": "trend",
+                                       "next": [_last + _slope * _k for _k in (1, 2, 3)],
+                                       "slope": _slope, "direction": _dir}
+            except Exception:
+                pass
+        if self.config.get("seasonality", True):
+            try:
+                _best = None
+                for _sp in self.repo.all():
+                    if not isinstance(_sp, dict) or _sp.get("type") != "seasonal":
+                        continue
+                    try:
+                        _ff = _sp.get("features", {}) or {}
+                        _pp = int(_ff.get("period", 0) or 0)
+                        _ss = float(_ff.get("seasonal_strength", 0.0) or 0.0)
+                        _sq = list(_sp.get("sequence", []) or [])
+                    except (TypeError, ValueError):
+                        continue
+                    if _pp >= 2 and _ss >= 0.5 and len(_sq) >= _pp:
+                        if _best is None or _ss > _best[0]:
+                            _best = (_ss, _pp, _sq)
+                if _best is not None and _tvals:
+                    _ss, _pp, _sq = _best
+                    _phase = _sq[len(_tvals) % _pp]
+                    if _phase is not None:
+                        extrap["seasonal"] = {"source": "seasonal", "next": [_phase], "period": _pp}
+            except Exception:
+                pass
         return {"current": cur, "predictions": preds, "context": ctx_preds, "log_loss": log_loss,
                 "extrapolation": extrap,
                 "reason": expl, "explanation": expl, "evidence": {"matrix_states": states}}
+
+    def predict_next(self, data, current=None):
+        """Single best next symbol (v2 additive; does not alter predict()).
+
+        Precedence: arithmetic when extrapolation kind != unknown and
+        confidence >= 0.9; else context top when its probability >= markov
+        top (ties go to context); else markov top; else none.
+        """
+        try:
+            _full = self.predict(data, current=current)
+        except Exception:
+            return {"next": None, "probability": 0.0, "source": "none", "evidence": "no recorded transitions"}
+        try:
+            _ex = _full.get("extrapolation", {}) or {}
+            if isinstance(_ex, dict) and _ex.get("kind") not in (None, "unknown") and _ex.get("next"):
+                try:
+                    _conf = float(_ex.get("confidence", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    _conf = 0.0
+                if _conf >= 0.9:
+                    _nxts = list(_ex.get("next") or [])
+                    if _nxts:
+                        return {"next": _nxts[0], "probability": max(0.0, min(1.0, _conf)),
+                                "source": "arithmetic",
+                                "evidence": "extrapolation kind %s confidence %.3f." % (_ex.get("kind"), _conf)}
+        except Exception:
+            pass
+        try:
+            _ctx = list(_full.get("context", []) or [])
+            _mk = list(_full.get("predictions", []) or [])
+            _ct = _ctx[0] if _ctx else None
+            _mt = _mk[0] if _mk else None
+            try:
+                _cp = float(_ct.get("probability", 0.0)) if isinstance(_ct, dict) else -1.0
+            except (TypeError, ValueError):
+                _cp = -1.0
+            try:
+                _mp = float(_mt.get("probability", 0.0)) if isinstance(_mt, dict) else -1.0
+            except (TypeError, ValueError):
+                _mp = -1.0
+            if isinstance(_ct, dict) and _cp >= 0.0 and (not isinstance(_mt, dict) or _cp >= _mp):
+                return {"next": _ct.get("next"), "probability": max(0.0, min(1.0, _cp)),
+                        "source": "context", "evidence": str(_ct.get("evidence", ""))}
+            if isinstance(_mt, dict) and _mp >= 0.0:
+                return {"next": _mt.get("next"), "probability": max(0.0, min(1.0, _mp)),
+                        "source": "markov", "evidence": str(_mt.get("evidence", ""))}
+        except Exception:
+            pass
+        return {"next": None, "probability": 0.0, "source": "none", "evidence": "no recorded transitions"}
 
     def get_pattern(self, pid):
         """Return one stored pattern dict (or None)."""

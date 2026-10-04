@@ -1,7 +1,7 @@
-"""Nexora v1.0.0 evaluation: 10 problems with known ground truth.
+"""Nexora v1 evaluation: 15 problems with known ground truth.
 
 Each problem asserts a concrete, numerically-margined expectation and
-prints PASS/FAIL with the key numbers. Exit 0 iff 10/10 pass.
+prints PASS/FAIL with the key numbers. Exit 0 iff 15/15 pass.
 Deterministic (fixed literals or random.Random(42)).
 
 Run: python examples/eval_10.py   (from repo root; stdlib only)
@@ -123,6 +123,72 @@ q = nx10.quality(d[:30])
 ok = pats == [] and isinstance(det["explanation"], str) and 0.0 <= q["quality"] <= 1.0
 check("10 random tokens (control)", ok, f"frequent seqs={len(pats)} (expect 0); no crash; quality={q['quality']:.2f} ({dt:.2f}s)")
 
+# 11. Concept drift -> EVOLVING ---------------------------------------
+# Same signature re-observed (counts match so patterns merge); the
+# doubled frequency + refreshed count produce drift >= 0.4 -> EVOLVING.
+nx11 = Nexora()
+nx11.discover([5.0] * 10)
+nx11.discover([5.0] * 10)
+t0 = time.perf_counter()
+states = {p["state"] for p in nx11.repo.all()}
+ok = "EVOLVING" in states
+check("11 concept drift", ok, f"states={sorted(states)} (expect EVOLVING present) ({time.perf_counter()-t0:.2f}s)")
+
+# 12. Save/load fidelity ------------------------------------------------
+import json as _json
+import tempfile as _tf
+import os as _os
+nx12 = Nexora(config={"min_support": 2})
+before = nx12.discover(list("ABCABCABC"))
+t0 = time.perf_counter()
+with _tf.TemporaryDirectory() as _td:
+    _fp = _os.path.join(_td, "s.json")
+    nx12.save(_fp)
+    nx12b = Nexora()
+    nx12b.load(_fp)
+same_pat = _json.dumps(nx12.repo.all(), sort_keys=True, default=str) == \
+           _json.dumps(nx12b.repo.all(), sort_keys=True, default=str)
+same_pred = nx12.predict(list("ABC"))["predictions"] == nx12b.predict(list("ABC"))["predictions"]
+same_trail = nx12._trail == nx12b._trail
+ok = same_pat and same_pred and same_trail
+check("12 save/load fidelity", ok,
+      f"patterns={same_pat} predictions={same_pred} trails={same_trail} ({time.perf_counter()-t0:.2f}s)")
+
+# 13. Lifecycle progression ---------------------------------------------
+nx13 = Nexora(config={"min_support": 2})
+t0 = time.perf_counter()
+nx13.discover(list("ABCABCABC"))
+s1 = {p["state"] for p in nx13.repo.all()}
+nx13.discover(list("ABCABCABC"))
+s2 = {p["state"] for p in nx13.repo.all()}
+ok = s1 == {"OBSERVED"} and "CONFIRMED" in s2
+check("13 lifecycle OBSERVED->CONFIRMED", ok, f"after1={sorted(s1)} after2={sorted(s2)} ({time.perf_counter()-t0:.2f}s)")
+
+# 14. Categorical novel transition ----------------------------------------
+nx14 = Nexora(config={"min_support": 2})
+nx14.discover(list("ABCABCABCABC"))
+t0 = time.perf_counter()
+out14 = nx14.find_anomalies(list("ABZ"))
+mt = [a for a in out14["anomalies"] if a["kind"] == "missing_transition"]
+ok = any(a["index"] == 2 for a in mt)
+check("14 novel B->Z transition", ok,
+      f"missing_transition at {[a['index'] for a in mt]} (expect [2]) ({time.perf_counter()-t0:.2f}s)")
+
+# 15. Invalid config fail-fast --------------------------------------------
+t0 = time.perf_counter()
+try:
+    Nexora({"z_threshold": -1})
+    ok1 = False
+except ValueError:
+    ok1 = True
+try:
+    nx15 = Nexora({"bogus_key": 9})
+    ok2 = "bogus_key" not in nx15.config
+except Exception:
+    ok2 = False
+ok = ok1 and ok2
+check("15 config fail-fast", ok, f"bad raises={ok1}; unknown ignored={ok2} ({time.perf_counter()-t0:.2f}s)")
+
 n_ok = sum(1 for _, ok, _ in results if ok)
-print(f"\nSCORE: {n_ok}/10")
-sys.exit(0 if n_ok == 10 else 1)
+print(f"\nSCORE: {n_ok}/15")
+sys.exit(0 if n_ok == 15 else 1)

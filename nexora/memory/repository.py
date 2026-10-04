@@ -1,10 +1,18 @@
-"""Pattern repository with JSON file persistence (v0.1).
+"""Pattern repository with JSON file persistence.
 
-Persistence is a plain JSON file (no vector DB / sqlite required for v0.1).
-Dedupe signature uses hashlib.md5 truncated to 12 hex chars. NOTE: md5 is
-used here only as a non-cryptographic dedupe/fingerprint key, NOT for any
-security purpose.
+Persistence is a plain JSON file (no vector DB / sqlite required).
+Dedupe signature uses hashlib.sha256 truncated to 12 hex chars. NOTE:
+sha256 is used here only as a non-cryptographic dedupe/fingerprint key,
+NOT for any security purpose.
+
+v2 notes:
+- get()/all() return deep copies: mutating a returned pattern never
+  mutates the store.
+- update() silently ignores identity keys {"id", "type", "frequency",
+  "occurrences", "sequence", "features"}: a patch can never change a
+  pattern's identity. Returns True if pid found else False.
 """
+import copy
 import hashlib
 import json
 import os
@@ -46,14 +54,17 @@ def _to_dict(pattern):
 
 
 def signature_of(pattern):
-    """Dedupe signature: md5(json({type, features, sequence}))[:12]."""
+    """Dedupe signature: sha256(json({type, features, sequence}))[:12].
+
+    Non-crypto use: fingerprint only, truncated for short keys.
+    """
     t = _get(pattern, "type", "unknown")
     f = _get(pattern, "features", {}) or {}
     s = _get(pattern, "sequence", []) or []
     payload = json.dumps({"type": t, "features": f, "sequence": s},
                          sort_keys=True, default=str)
     # Non-crypto use: fingerprint only, truncated for short keys.
-    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
 class PatternRepository:
@@ -96,6 +107,13 @@ class PatternRepository:
             occ = d.get("occurrences") or []
             if occ:
                 cur.setdefault("occurrences", []).extend(list(occ))
+            try:
+                _occ = cur.get("occurrences") or []
+                _feats = cur.get("features")
+                if isinstance(_feats, dict) and _occ and "count" in _feats:
+                    _feats["count"] = len(_occ)
+            except Exception:
+                pass
             if d.get("last_seen") is not None:
                 try:
                     if cur.get("last_seen") is None or d["last_seen"] > cur["last_seen"]:
@@ -118,30 +136,61 @@ class PatternRepository:
         return pid
 
     def get(self, pid):
+        """Deep copy of the stored pattern (None if missing).
+
+        Mutating the result never mutates the store (deepcopy, with a
+        dict/list-copy fallback for exotic values).
+        """
         p = self._patterns.get(pid)
-        return dict(p) if isinstance(p, dict) else p
+        if p is None:
+            return None
+        if isinstance(p, dict):
+            try:
+                return copy.deepcopy(p)
+            except Exception:
+                fb = dict(p)
+                for k, v in fb.items():
+                    if isinstance(v, list):
+                        fb[k] = list(v)
+                    elif isinstance(v, dict):
+                        fb[k] = dict(v)
+                return fb
+        try:
+            return copy.deepcopy(p)
+        except Exception:
+            return p
 
     def update(self, pid, patch):
         """Merge patch dict into a stored pattern; returns True if found.
 
+        Identity keys {"id", "type", "frequency", "occurrences",
+        "sequence", "features"} are silently ignored: a patch can update
+        state, relationships, confidence, scores — never identity.
         Used by the engine to persist lifecycle states, evolution flags,
         and relationship maps without changing the pattern's identity
-        (signature, frequency, occurrences untouched unless in patch).
+        (signature, frequency, occurrences untouched).
         """
         cur = self._patterns.get(pid)
         if cur is None or not isinstance(patch, dict):
             return False
         for k, v in patch.items():
-            if k == "id":
+            if k in ("id", "type", "frequency", "occurrences", "sequence", "features"):
                 continue
             cur[k] = v
         return True
 
     def all(self):
-        return [dict(v) for v in self._patterns.values()]
+        """Deep copies of all stored patterns (mutation-safe; see get())."""
+        out = []
+        for v in self._patterns.values():
+            try:
+                out.append(copy.deepcopy(v))
+            except Exception:
+                out.append(dict(v) if isinstance(v, dict) else v)
+        return out
 
     def find_by_type(self, t):
-        return [dict(v) for v in self._patterns.values() if v.get("type") == t]
+        return [p for p in self.all() if p.get("type") == t]
 
     def size(self):
         return len(self._patterns)
@@ -157,7 +206,10 @@ class PatternRepository:
             if not isinstance(p, dict) or p.get("id") is None:
                 continue
             pid = str(p["id"])
-            self._patterns[pid] = dict(p)
+            try:
+                self._patterns[pid] = copy.deepcopy(p)
+            except Exception:
+                self._patterns[pid] = dict(p)
             try:
                 self._sig_to_id[signature_of(p)] = pid
             except Exception:

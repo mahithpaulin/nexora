@@ -57,6 +57,9 @@ def detect(values_or_rows, stats=None, z_threshold=3.0, patterns=None):
     Score is 0..1 (higher = more anomalous). Every hit carries a
     human-readable explanation; context comes from the passed stats dict
     (mean/stdev) and known-pattern bigrams.
+
+    v2: z_threshold <= 0 raises ValueError (previously silently reset to
+    3.0). Non-numeric thresholds still fall back to 3.0.
     """
     stats = stats or {}
     if not isinstance(stats, dict):
@@ -76,7 +79,7 @@ def detect(values_or_rows, stats=None, z_threshold=3.0, patterns=None):
     except (TypeError, ValueError):
         zt = 3.0
     if zt <= 0:
-        zt = 3.0
+        raise ValueError("z_threshold must be positive, got %r" % (z_threshold,))
 
     rows = _rows(values_or_rows)
     known_bi, expected = _known_sequences(patterns)

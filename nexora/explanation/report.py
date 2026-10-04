@@ -71,6 +71,27 @@ def _capped(items, limit=10):
     return shown, (rem if rem > 0 else 0)
 
 
+def _eff_cap(limit, default):
+    """Effective per-section cap for the v2 ``limit`` param. Never raises.
+
+    limit=None keeps the default cap; limit=int caps the section to
+    min(limit, default) floored at 0. bool/non-int limits are ignored
+    (default kept) to preserve the never-raises guarantee.
+    """
+    try:
+        if limit is None:
+            return default
+        if isinstance(limit, bool):
+            return default
+        if not isinstance(limit, int):
+            return default
+        if limit < 0:
+            return 0
+        return min(limit, default)
+    except Exception:
+        return default
+
+
 def pattern_card(pattern):
     """Markdown card for one pattern. Never raises."""
     try:
@@ -231,11 +252,17 @@ def _collections(result):
     return patterns, matches, anomalies, predictions, overall
 
 
-def render_markdown(result):
-    """Full markdown report (caps: 20 patterns / 20 anomalies / 10 predictions / 5 matches). Never raises."""
+def render_markdown(result, limit=None):
+    """Full markdown report (caps: 20 patterns / 20 anomalies / 10 predictions / 5 matches). Never raises.
+
+    v2: optional ``limit`` caps EACH section to min(limit, default cap);
+    None keeps defaults. Old single-arg calls keep working.
+    """
     try:
         patterns, matches, anomalies, predictions, overall = _collections(result)
         np_, nm_, na_, npr_ = len(patterns), len(matches), len(anomalies), len(predictions)
+        cap_p, cap_a = _eff_cap(limit, MAX_PATTERNS_MD), _eff_cap(limit, MAX_ANOMALIES)
+        cap_pr, cap_m = _eff_cap(limit, MAX_PREDICTIONS), _eff_cap(limit, MAX_MATCHES)
         out = ["# Nexora report", ""]
         summary = "Found {} pattern(s), {} match(es), {} anomalie(s), {} prediction(s).".format(np_, nm_, na_, npr_)
         if overall.strip():
@@ -246,14 +273,14 @@ def render_markdown(result):
         out.append("## Patterns ({})".format(np_))
         out.append("")
         sp = _sorted_patterns(patterns)
-        for p in sp[:MAX_PATTERNS_MD]:
+        for p in sp[:cap_p]:
             try:
                 out.append(pattern_card(p))
             except Exception:
                 out.append("## ? `?`")
             out.append("")
-        if np_ > MAX_PATTERNS_MD:
-            out.append("+{} more pattern(s)".format(np_ - MAX_PATTERNS_MD))
+        if np_ > cap_p:
+            out.append("+{} more pattern(s)".format(np_ - cap_p))
             out.append("")
 
         out.append("## Anomalies ({})".format(na_))
@@ -264,16 +291,16 @@ def render_markdown(result):
         else:
             out.append("| index | value | kind | score | why |")
             out.append("| --- | --- | --- | --- | --- |")
-            for a in _sorted_anomalies(anomalies)[:MAX_ANOMALIES]:
+            for a in _sorted_anomalies(anomalies)[:cap_a]:
                 idx = _escape_cell(_get(a, "index", "?"))
                 val = _escape_cell(_get(a, "value", "?"))
                 kind = _escape_cell(_get(a, "kind", "?"))
                 score = _escape_cell(_get(a, "score", _get(a, "anomaly_score", "?")))
                 why = _escape_cell(_get(a, "why", _get(a, "explanation", _get(a, "reason", "?"))))
                 out.append("| {} | {} | {} | {} | {} |".format(idx, val, kind, score, why))
-            if na_ > MAX_ANOMALIES:
+            if na_ > cap_a:
                 out.append("")
-                out.append("+{} more anomalie(s)".format(na_ - MAX_ANOMALIES))
+                out.append("+{} more anomalie(s)".format(na_ - cap_a))
             out.append("")
 
         out.append("## Predictions ({})".format(npr_))
@@ -282,7 +309,7 @@ def render_markdown(result):
             out.append("None.")
             out.append("")
         else:
-            for pr in predictions[:MAX_PREDICTIONS]:
+            for pr in predictions[:cap_pr]:
                 nxt = _escape_cell(_get(pr, "next", _get(pr, "value", _get(pr, "predicted", "?"))))
                 prob = _escape_cell(_get(pr, "prob", _get(pr, "probability", _get(pr, "confidence", "?"))))
                 ev = _get(pr, "evidence", _get(pr, "support", _get(pr, "based_on", "")))
@@ -292,8 +319,8 @@ def render_markdown(result):
                 if ev_rem > 0:
                     ev_s += " +{} more".format(ev_rem)
                 out.append("- next: {} | prob: {} | evidence: {}".format(nxt, prob, ev_s if ev_s else "none"))
-            if npr_ > MAX_PREDICTIONS:
-                out.append("+{} more prediction(s)".format(npr_ - MAX_PREDICTIONS))
+            if npr_ > cap_pr:
+                out.append("+{} more prediction(s)".format(npr_ - cap_pr))
             out.append("")
 
         out.append("## Matches ({})".format(nm_))
@@ -302,14 +329,14 @@ def render_markdown(result):
             out.append("None.")
             out.append("")
         else:
-            for m in _sorted_matches(matches)[:MAX_MATCHES]:
+            for m in _sorted_matches(matches)[:cap_m]:
                 mid = _escape_cell(_get(m, "pattern_id", _get(m, "id", _get(m, "pattern", "?"))))
                 sim = _escape_cell(_get(m, "similarity", _get(m, "score", _get(m, "confidence", "?"))))
                 idx = _get(m, "index", None)
                 extra_s = " | index: {}".format(_escape_cell(idx)) if idx is not None else ""
                 out.append("- {}: similarity {}{}".format(mid, sim, extra_s))
-            if nm_ > MAX_MATCHES:
-                out.append("+{} more match(es)".format(nm_ - MAX_MATCHES))
+            if nm_ > cap_m:
+                out.append("+{} more match(es)".format(nm_ - cap_m))
             out.append("")
         return "\n".join(out).rstrip() + "\n"
     except Exception:
@@ -319,11 +346,17 @@ def render_markdown(result):
             return "# Nexora report\n"
 
 
-def render_text(result):
-    """Plain-text report (no markdown chars). Same caps. Never raises."""
+def render_text(result, limit=None):
+    """Plain-text report (no markdown chars). Same caps. Never raises.
+
+    v2: optional ``limit`` caps EACH section to min(limit, default cap);
+    None keeps defaults. Old single-arg calls keep working.
+    """
     try:
         patterns, matches, anomalies, predictions, overall = _collections(result)
         np_, nm_, na_, npr_ = len(patterns), len(matches), len(anomalies), len(predictions)
+        cap_p, cap_a = _eff_cap(limit, MAX_PATTERNS_MD), _eff_cap(limit, MAX_ANOMALIES)
+        cap_pr, cap_m = _eff_cap(limit, MAX_PREDICTIONS), _eff_cap(limit, MAX_MATCHES)
         out = ["Nexora report", ""]
         summary = "Summary: {} patterns, {} matches, {} anomalies, {} predictions.".format(np_, nm_, na_, npr_)
         if _plain(overall).strip():
@@ -335,7 +368,7 @@ def render_text(result):
         sp = _sorted_patterns(patterns)
         if np_ == 0:
             out.append("  none")
-        for p in sp[:MAX_PATTERNS_MD]:
+        for p in sp[:cap_p]:
             try:
                 pid = _plain(_get(p, "id", "?"))
                 ptype = _plain(_get(p, "type", "?"))
@@ -381,28 +414,28 @@ def render_text(result):
                 out.append("    why: observed {} times with frequency {} and confidence {}.".format(len(occ), freq, conf))
             except Exception:
                 out.append("  pattern unavailable")
-        if np_ > MAX_PATTERNS_MD:
-            out.append("  +{} more patterns".format(np_ - MAX_PATTERNS_MD))
+        if np_ > cap_p:
+            out.append("  +{} more patterns".format(np_ - cap_p))
         out.append("")
 
         out.append("Anomalies ({}):".format(na_))
         if na_ == 0:
             out.append("  none")
-        for a in _sorted_anomalies(anomalies)[:MAX_ANOMALIES]:
+        for a in _sorted_anomalies(anomalies)[:cap_a]:
             idx = _plain(_get(a, "index", "?"))
             val = _plain(_get(a, "value", "?"))
             kind = _plain(_get(a, "kind", "?"))
             score = _plain(_get(a, "score", _get(a, "anomaly_score", "?")))
             why = _plain(_get(a, "why", _get(a, "explanation", _get(a, "reason", "?"))))
             out.append("  index {} value {} kind {} score {} why {}".format(idx, val, kind, score, why))
-        if na_ > MAX_ANOMALIES:
-            out.append("  +{} more anomalies".format(na_ - MAX_ANOMALIES))
+        if na_ > cap_a:
+            out.append("  +{} more anomalies".format(na_ - cap_a))
         out.append("")
 
         out.append("Predictions ({}):".format(npr_))
         if npr_ == 0:
             out.append("  none")
-        for pr in predictions[:MAX_PREDICTIONS]:
+        for pr in predictions[:cap_pr]:
             nxt = _plain(_get(pr, "next", _get(pr, "value", _get(pr, "predicted", "?"))))
             prob = _plain(_get(pr, "prob", _get(pr, "probability", _get(pr, "confidence", "?"))))
             ev = _get(pr, "evidence", _get(pr, "support", _get(pr, "based_on", "")))
@@ -412,19 +445,19 @@ def render_text(result):
             if erem > 0:
                 ev_s += " +{} more".format(erem)
             out.append("  next {} prob {} evidence {}".format(nxt, prob, ev_s))
-        if npr_ > MAX_PREDICTIONS:
-            out.append("  +{} more predictions".format(npr_ - MAX_PREDICTIONS))
+        if npr_ > cap_pr:
+            out.append("  +{} more predictions".format(npr_ - cap_pr))
         out.append("")
 
         out.append("Matches ({}):".format(nm_))
         if nm_ == 0:
             out.append("  none")
-        for m in _sorted_matches(matches)[:MAX_MATCHES]:
+        for m in _sorted_matches(matches)[:cap_m]:
             mid = _plain(_get(m, "pattern_id", _get(m, "id", _get(m, "pattern", "?"))))
             sim = _plain(_get(m, "similarity", _get(m, "score", _get(m, "confidence", "?"))))
             out.append("  pattern {} similarity {}".format(mid, sim))
-        if nm_ > MAX_MATCHES:
-            out.append("  +{} more matches".format(nm_ - MAX_MATCHES))
+        if nm_ > cap_m:
+            out.append("  +{} more matches".format(nm_ - cap_m))
         out.append("")
         return "\n".join(out).rstrip() + "\n"
     except Exception:

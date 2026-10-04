@@ -2,10 +2,13 @@
 
 While Markov prediction answers "what usually follows", this module answers
 "what MUST follow given the rule": constant finite differences (linear,
-quadratic, ...), constant ratios (geometric), and additive recurrence
-(Fibonacci-like). All classical, non-neural, exact for ints with a
-relative tolerance for floats. Missing (None/NaN) values are skipped by
-position (documented); non-numeric input raises ValueError.
+quadratic, ...), then additive recurrence (Fibonacci-like), then constant
+ratios (geometric). Detection priority is polynomial first, additive
+recurrence second, geometric last — so a constant series reads as
+arithmetic (difference 0), not geometric (ratio 1). All classical,
+non-neural, exact for ints with a relative tolerance for floats. Missing
+(None/NaN) values are skipped by position (documented); non-numeric input
+raises ValueError.
 """
 
 from __future__ import annotations
@@ -123,9 +126,12 @@ def detect_geometric(values):
 
 
 def detect_additive_recurrence(values):
-    """Fibonacci-like check x[n] == x[n-1] + x[n-2]. Returns {"next"} or None."""
+    """Fibonacci-like check x[n] == x[n-1] + x[n-2]. Returns {"next"} or None.
+
+    Needs >= 3 points (a single triple already evidences the rule).
+    """
     xs = _clean(values)
-    if len(xs) < 4:
+    if len(xs) < 3:
         return None
     for i in range(2, len(xs)):
         if not _close(xs[i], xs[i - 1] + xs[i - 2]):
@@ -140,8 +146,9 @@ _KIND_NAMES = {1: "arithmetic", 2: "quadratic", 3: "cubic"}
 
 
 def analyze_numeric_sequence(values, max_order=3, steps=1):
-    """Solve a numeric sequence by rule, in order: additive recurrence,
-    geometric, then polynomial (lowest constant-difference order wins).
+    """Solve a numeric sequence by rule, in order: polynomial (lowest
+    constant-difference order wins), then additive recurrence, then
+    geometric.
 
     Returns {"kind", "params", "next" (list of `steps` values),
     "confidence" (0..1), "explanation"}. kind is arithmetic/quadratic/
@@ -155,6 +162,21 @@ def analyze_numeric_sequence(values, max_order=3, steps=1):
                 "explanation": f"need >= 3 points for rule detection, got {len(xs)}."}
     exact = _is_int_like(xs)
     conf = 1.0 if exact else 0.95
+    fd = finite_differences(xs, max_order=max_order)
+    order = fd["constant_order"]
+    # Degenerate fits rejected: the constant level must hold >= 2 values
+    # (any N points are trivially interpolated by an order-(N-1) polynomial,
+    # which predicts nothing). Needs >= order+2 points.
+    if order is not None and len(fd["table"][order]) < 2:
+        order = None
+    if order is not None:
+        tail = extrapolate_poly(xs, order, steps)
+        kind = _KIND_NAMES.get(order, f"poly-order-{order}")
+        d = fd["table"][order][0]
+        return {"kind": kind, "params": {"order": order, "difference": d},
+                "next": tail, "confidence": conf,
+                "explanation": f"order-{order} differences are constant ({d}); "
+                               f"next {tail[0]}; confidence {conf:.2f}."}
     add = detect_additive_recurrence(xs)
     if add is not None:
         tail = [add["next"]]
@@ -174,20 +196,5 @@ def analyze_numeric_sequence(values, max_order=3, steps=1):
                 "next": tail, "confidence": conf,
                 "explanation": f"constant ratio {geo['ratio']} between consecutive terms; "
                                f"next {tail[0]}; confidence {conf:.2f}."}
-    fd = finite_differences(xs, max_order=max_order)
-    order = fd["constant_order"]
-    # Degenerate fits rejected: the constant level must hold >= 2 values
-    # (any N points are trivially interpolated by an order-(N-1) polynomial,
-    # which predicts nothing). Needs >= order+2 points.
-    if order is not None and len(fd["table"][order]) < 2:
-        order = None
-    if order is not None:
-        tail = extrapolate_poly(xs, order, steps)
-        kind = _KIND_NAMES.get(order, f"poly-order-{order}")
-        d = fd["table"][order][0]
-        return {"kind": kind, "params": {"order": order, "difference": d},
-                "next": tail, "confidence": conf,
-                "explanation": f"order-{order} differences are constant ({d}); "
-                               f"next {tail[0]}; confidence {conf:.2f}."}
     return {"kind": "unknown", "params": {}, "next": [], "confidence": 0.0,
-            "explanation": "no constant-difference, constant-ratio, or additive-recurrence rule fits."}
+            "explanation": "no constant-difference, additive-recurrence, or constant-ratio rule fits."}

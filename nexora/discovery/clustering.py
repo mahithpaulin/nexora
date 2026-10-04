@@ -227,7 +227,18 @@ def agglomerative(vectors, n_clusters):
 
 
 def find_regimes(values, size=8, k=2, method="kmeans"):
-    """Inputs: values (1-D series; windows with None/NaN/inf skipped), size (int>=1 window len), k (int>=1 target clusters; ignored for dbscan; clamped to #windows for kmeans/agglomerative), method (kmeans|dbscan|agglomerative; dbscan auto-eps=1.5x mean nearest-neighbour dist, min_pts=3). Outputs: list sorted by cluster id of pattern-dicts with keys exactly {id None, type regime, features {method,cluster,size,count,support,centroid}, sequence (centroid), frequency (count), occurrences ([window starts]), confidence (support)}. [] if no valid windows. Deterministic. Scores: support/confidence in 0..1 (count/#windows). Raises ValueError on size<1, k<1, unknown method."""
+    """Inputs: values (1-D series; windows with None/NaN/inf skipped), size (int>=1 window len), k (int>=1 target clusters; ignored for dbscan; clamped to #windows for kmeans/agglomerative), method (kmeans|dbscan|agglomerative; dbscan auto-eps=1.5x mean nearest-neighbour dist, min_pts=3). Outputs: list sorted by cluster id of pattern-dicts with keys exactly {id None, type regime, features {method,cluster,size,count,support,centroid}, sequence (centroid), frequency (count), occurrences ([window starts]), confidence (support)}. [] if no valid windows (or all windows are dbscan noise). Deterministic. Scores: support/confidence in 0..1 (count/#windows, noise windows included in the denominator but never emitted). Raises ValueError on size<1, k<1, unknown method, and (v2) when method != "kmeans" and #windows > 1000 (suggests kmeans).
+
+    v2 notes:
+    - method="dbscan": noise label -1 is filtered out — noise windows are
+      counted in dbscan's reason string (via n_noise) but never emitted as
+      regime patterns. kmeans/agglomerative paths are unchanged.
+    - Size guard: method != "kmeans" with > 1000 windows raises ValueError
+      suggesting kmeans, because dbscan builds an O(n^2) pairwise
+      neighborhood and agglomerative holds an O(n^2) distance matrix with
+      O(n^3) single-linkage merging — both infeasible at large n, while
+      kmeans stays O(n*k*iter). Determinism preserved throughout.
+    """
     if not isinstance(size, int) or size < 1:
         raise ValueError("size must be an int >= 1")
     if not isinstance(k, int) or k < 1:
@@ -237,6 +248,12 @@ def find_regimes(values, size=8, k=2, method="kmeans"):
     vecs, starts = windows(values, size)
     if not vecs:
         return []
+    if method != "kmeans" and len(vecs) > 1000:
+        raise ValueError(
+            f"too many windows ({len(vecs)}) for method={method!r} "
+            "with O(n^2)/O(n^3) cost (dbscan pairwise neighborhoods, "
+            "agglomerative distance matrix + merging); use method='kmeans'"
+        )
     if method == "kmeans":
         ke = min(k, len(vecs))
         r = kmeans(vecs, ke)
@@ -249,10 +266,12 @@ def find_regimes(values, size=8, k=2, method="kmeans"):
     else:
         r = dbscan(vecs, _auto_eps(vecs), 3)
         labs = r["labels"]
-        cents = {t: _mean([v for v, lb in zip(vecs, labs) if lb == t]) for t in sorted(set(labs))}
+        cents = {t: _mean([v for v, lb in zip(vecs, labs) if lb == t]) for t in sorted(set(labs)) if t != -1}
     tot = len(vecs)
     out = []
     for t in sorted(set(labs)):
+        if method == "dbscan" and t == -1:
+            continue  # noise reported in dbscan reason, not as patterns
         idx = [i for i, lb in enumerate(labs) if lb == t]
         cnt = len(idx)
         sup = cnt / tot
