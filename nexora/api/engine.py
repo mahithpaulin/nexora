@@ -60,6 +60,10 @@ except ImportError:
     _evo_snapshot = _evo_drift = None
     build_relationships = attach_relationships = None
 try:
+    from nexora.discovery.arithmetic import analyze_numeric_sequence as _analyze_seq
+except ImportError:
+    _analyze_seq = None
+try:
     from nexora.ingestion.quality import quality_report as _quality_report
 except ImportError:
     _quality_report = None
@@ -397,6 +401,24 @@ class Nexora:
                                  "context": {}, "metadata": {}, "state": "NEW"})
             except Exception:
                 pass
+        if _analyze_seq is not None and len(nums) >= 3:
+            try:
+                sol = _analyze_seq(nums, steps=1)
+                if sol.get("kind") != "unknown" and sol.get("next"):
+                    nxt = sol["next"][0]
+                    feats = {"kind": sol["kind"], "next": nxt}
+                    for k, v in (sol.get("params", {}) or {}).items():
+                        if isinstance(v, (int, float, str)):
+                            feats[str(k)] = v
+                    self._store({"type": "arithmetic", "features": feats,
+                                 "sequence": [nxt],
+                                 "relationships": {}, "frequency": 1,
+                                 "first_seen": None, "last_seen": None, "occurrences": [],
+                                 "confidence": float(sol.get("confidence", 0.0)),
+                                 "similarity": 1.0, "novelty": 0.0,
+                                 "context": {}, "metadata": {}, "state": "NEW"})
+            except Exception:
+                pass
         if build_relationships is not None:
             try:
                 current = self.repo.all()
@@ -511,7 +533,17 @@ class Nexora:
                 pass
         expl = "Predicted %d candidate(s) after '%s'." % (len(preds), cur)
         states = (self._matrix or {}).get("states", [])
+        extrap = {}
+        if _analyze_seq is not None:
+            try:
+                vals = [r.get("value") for r in _rows(data)
+                        if isinstance(r.get("value"), (int, float)) and not isinstance(r.get("value"), bool)]
+                if len(vals) >= 3:
+                    extrap = _analyze_seq(vals, steps=3)
+            except Exception:
+                extrap = {}
         return {"current": cur, "predictions": preds, "context": ctx_preds, "log_loss": log_loss,
+                "extrapolation": extrap,
                 "reason": expl, "explanation": expl, "evidence": {"matrix_states": states}}
 
     def get_pattern(self, pid):
