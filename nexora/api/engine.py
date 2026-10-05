@@ -63,6 +63,12 @@ except ImportError:
     _evo_snapshot = _evo_drift = None
     build_relationships = attach_relationships = None
 try:
+    from nexora.anomaly.robust import robust_detect as _robust_detect
+    from nexora.anomaly.robust import level_shift_records as _level_shifts
+    from nexora.anomaly.robust import severity_of as _severity_of
+except ImportError:
+    _robust_detect = _level_shifts = _severity_of = None
+try:
     from nexora.discovery.arithmetic import analyze_numeric_sequence as _analyze_seq
 except ImportError:
     _analyze_seq = None
@@ -121,6 +127,8 @@ DEFAULT_CONFIG = {"z_threshold": 3.0, "min_support": 3, "max_n": 3, "window": 20
                   "correlation": True, "corr_threshold": 0.7,
                   "seasonality": True, "context_order": 2,
                   "multivariate": True, "mv_window": 5, "mv_threshold": 0.8,
+                  "robust": True, "robust_window": 20, "robust_threshold": 3.5,
+                  "level_shifts": True, "ls_window": 10, "ls_threshold": 3.0,
                   "evolve_drift": 0.4, "max_period": 256}
 
 
@@ -293,7 +301,8 @@ def _merge_anomalies(out):
                    (" with z=%.2f" % z) if z is not None else "",
                    "; ".join(str(c) for c in causes) or "none"))
         merged.append({"index": idx, "value": val, "z": z, "score": score,
-                       "kind": "+".join(kinds), "causes": causes, "explanation": expl})
+                       "kind": "+".join(kinds), "causes": causes, "explanation": expl,
+                       "severity": _severity_of(score) if _severity_of else "high"})
     merged.sort(key=lambda d: (d.get("index", 0), str(d.get("kind", ""))))
     return merged
 
@@ -987,6 +996,10 @@ class Nexora:
                             ri = pairs[_ei][0]
                             rv = pairs[_ei][1]
                     dims = mv.get("dims", msize)
+                    try:
+                        _msev = _severity_of(a["score"]) if _severity_of else "high"
+                    except Exception:
+                        _msev = "high"
                     out.append({
                         "index": ri, "value": rv, "z": None, "score": a["score"],
                         "kind": "multivariate",
@@ -995,8 +1008,56 @@ class Nexora:
                                                 "Mahalanobis d2=%.2f across %d dims, score %.2f "
                                                 "(threshold %s)." % (ri, a["d2"], dims, a["score"],
                                                                       self.config.get("mv_threshold", 0.8))),
+                                "severity": _msev,
                             })
             except Exception:
+                pass
+        # WS4: robust rolling median/MAD scores (causal) + level shifts.
+        # Seasonal phase-centering comes from the strongest stored
+        # seasonal pattern, if any qualifies.
+        if _robust_detect is not None and self.config.get("robust", True):
+            try:
+                _per = None
+                try:
+                    _best = None
+                    for _sp in self.repo.all():
+                        if not isinstance(_sp, dict) or _sp.get("type") != "seasonal":
+                            continue
+                        _ff = _sp.get("features", {}) or {}
+                        _pp = int(_ff.get("period", 0) or 0)
+                        _ss = float(_ff.get("seasonal_strength", 0.0) or 0.0)
+                        if _pp >= 2 and _ss >= 0.5 and (_best is None or _ss > _best[0]):
+                            _best = (_ss, _pp)
+                    if _best is not None:
+                        _per = _best[1]
+                except Exception:
+                    _per = None
+                try:
+                    _rw = max(1, int(self.config.get("robust_window", 20)))
+                except (TypeError, ValueError):
+                    _rw = 20
+                try:
+                    _rt = float(self.config.get("robust_threshold", 3.5))
+                except (TypeError, ValueError):
+                    _rt = 3.5
+                try:
+                    out.extend(_robust_detect(rows, window=_rw, threshold=_rt, period=_per) or [])
+                except (ValueError, TypeError):
+                    pass
+            except Exception:
+                pass
+        if _level_shifts is not None and self.config.get("level_shifts", True):
+            try:
+                _lw = max(1, int(self.config.get("ls_window", 10)))
+            except (TypeError, ValueError):
+                _lw = 10
+            try:
+                _lt = float(self.config.get("ls_threshold", 3.0))
+            except (TypeError, ValueError):
+                _lt = 3.0
+            try:
+                out.extend(_level_shifts(rows, window=_lw, threshold_z=_lt) or [])
+            except (ValueError, TypeError):
                 pass
         # D3: one event produces one record — merge same-index hits.
         out = _merge_anomalies(out)

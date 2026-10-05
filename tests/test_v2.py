@@ -235,7 +235,8 @@ def test_multivariate_end_index_flagged():
     idxs = [a["index"] for a in out["anomalies"]]
     assert max(idxs) == 30
     assert idxs == [30]
-    assert out["anomalies"][0]["kind"] == "statistical"
+    # NOTE (v2/WS4): robust joins statistical in the single merged record.
+    assert "statistical" in out["anomalies"][0]["kind"]
 
 
 def test_quality_still_fine():

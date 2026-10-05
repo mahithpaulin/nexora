@@ -1,6 +1,22 @@
 """Statistical + sequence anomaly detection. Stdlib only, deterministic."""
 import math
 
+try:
+    from nexora.anomaly.robust import severity_of as _severity_of
+except ImportError:
+    def _severity_of(score):
+        try:
+            s = float(score)
+        except (TypeError, ValueError):
+            return "low"
+        if s < 0.5:
+            return "low"
+        if s < 0.7:
+            return "medium"
+        if s < 0.9:
+            return "high"
+        return "critical"
+
 
 def _get(p, key, default=None):
     if isinstance(p, dict):
@@ -99,6 +115,7 @@ def detect(values_or_rows, stats=None, z_threshold=3.0, patterns=None):
                     "explanation": ("Statistical outlier at index %s: value %s deviates "
                                     "z=%.2f from mean %.3f (stdev %.3f, threshold %.2f), score %.2f."
                                     % (idx, val, z, mean, stdev, zt, score)),
+                    "severity": _severity_of(score),
                 })
 
     # Sequence checks over label bigrams. Skipped when the series is
@@ -119,6 +136,7 @@ def detect(values_or_rows, stats=None, z_threshold=3.0, patterns=None):
                     "causes": ["transition %s->%s never seen; expected one of %s" % (a, b, exp)],
                     "explanation": ("Missing expected transition at index %s: observed %s->%s, "
                                     "but '%s' was previously seen going to %s; score 0.55." % (idx, a, b, a, exp)),
+                    "severity": _severity_of(0.55),
                 })
             else:
                 out.append({
@@ -127,6 +145,7 @@ def detect(values_or_rows, stats=None, z_threshold=3.0, patterns=None):
                     "causes": ["bigram (%s, %s) unseen in %d known pattern(s)" % (a, b, len(patterns or []))],
                     "explanation": ("Novel sequence at index %s: bigram '%s'->'%s' never appeared in "
                                     "known patterns; score 0.60." % (idx, a, b)),
+                    "severity": _severity_of(0.60),
                 })
     out.sort(key=lambda d: (d["index"], d["kind"]))
     return out

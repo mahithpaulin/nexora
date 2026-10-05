@@ -71,7 +71,11 @@ def test_d3_univariate_single_record():
     anoms = out["anomalies"]
     assert [a["index"] for a in anoms] == [30]
     assert len(anoms) == 1
-    assert anoms[0]["kind"] == "statistical"
+    # NOTE (v2/WS4): the robust rolling detector now also fires on the
+    # spike, so the single merged record unions both kinds (one event,
+    # one record — still no "multivariate", still no duplicate).
+    assert "statistical" in anoms[0]["kind"]
+    assert "robust" in anoms[0]["kind"]
     assert "multivariate" not in anoms[0]["kind"]
     assert math.isclose(anoms[0]["z"], 5.477, rel_tol=1e-3)
 

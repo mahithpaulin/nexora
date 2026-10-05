@@ -44,7 +44,9 @@ def test_known_two_regimes():
 def test_known_spike_flagged():
     d = [round(10 + (i % 5) * 0.2, 1) for i in range(60)] + [100.0]
     out = Nexora().find_anomalies(d)
-    stat = [a for a in out["anomalies"] if a["kind"] == "statistical"]
+    # NOTE (v2/WS4): one event yields one merged record whose kind unions
+    # all detectors that fired, so filter with `in`, not `==`.
+    stat = [a for a in out["anomalies"] if "statistical" in a["kind"]]
     assert any(a["index"] == 60 for a in stat)
 
 

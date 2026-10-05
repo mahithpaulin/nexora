@@ -88,7 +88,8 @@ check("10 neg corr r<-0.99", len(pats) == 1 and pats[0]["features"]["r"] < -0.99
 # 11-14 anomaly knowns + unknowns
 d = [round(10 + (i % 5) * 0.2, 1) for i in range(60)] + [100.0]
 out, dt = t(Nexora().find_anomalies, d)
-stat = [a for a in out["anomalies"] if a["kind"] == "statistical"]
+# NOTE (v2/WS4): merged records union detector kinds; `in`, not `==`.
+stat = [a for a in out["anomalies"] if "statistical" in a["kind"]]
 check("11 spike idx60", any(a["index"] == 60 for a in stat), f"flagged={[a['index'] for a in stat]} ({dt:.2f}s)")
 d = [10.0] * 30 + [60.0] + [10.0] * 30 + [60.0]
 out, dt = t(Nexora().find_anomalies, d)

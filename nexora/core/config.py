@@ -31,6 +31,12 @@ DEFAULTS = {
     "multivariate": True,
     "mv_window": 5,
     "mv_threshold": 0.8,
+    "robust": True,
+    "robust_window": 20,
+    "robust_threshold": 3.5,
+    "level_shifts": True,
+    "ls_window": 10,
+    "ls_threshold": 3.0,
     "evolve_drift": 0.4,
     "max_period": 256,
 }
@@ -51,6 +57,12 @@ SCHEMA = {
     "multivariate": (bool, None, None),
     "mv_window": (int, 2, 10**4),
     "mv_threshold": ((float, int), 0, 1),
+    "robust": (bool, None, None),
+    "robust_window": (int, 1, 10**6),
+    "robust_threshold": ((float, int), 0.1, 100),
+    "level_shifts": (bool, None, None),
+    "ls_window": (int, 1, 10**4),
+    "ls_threshold": ((float, int), 0.1, 100),
     "evolve_drift": ((float, int), 0, 1),
     "max_period": (int, 2, 10**6),
 }
@@ -69,6 +81,12 @@ KEY_DOCS = {
     "seasonality": "Enable seasonality detection if True; must be bool.",
     "context_order": "Markov context order, range [0, 10].",
     "multivariate": "Enable multivariate modelling if True; must be bool.",
+    "robust": "Enable rolling median/MAD anomaly scores if True; must be bool.",
+    "robust_window": "Trailing window for robust scores, range [1, 1000000].",
+    "robust_threshold": "Robust z-score cutoff, range [0.1, 100].",
+    "level_shifts": "Enable mean-shift level-shift records if True; must be bool.",
+    "ls_window": "Half-window for level-shift detection, range [1, 10000].",
+    "ls_threshold": "Level-shift |z| cutoff, range [0.1, 100].",
     "mv_window": "Multivariate window length, range [2, 10000].",
     "mv_threshold": "Multivariate agreement threshold, range [0, 1].",
     "evolve_drift": "Allowed drift per evolve step, range [0, 1].",
@@ -79,7 +97,8 @@ def validate_config(d=None):
 
     Ranges: z_threshold [0.1, 10]; min_support [1, 1000000]; max_n [2, 10];
     window [1, 1000000]; weights dict; regimes/correlation/seasonality/
-    multivariate/prune_redundant bool (exact type, int rejected); regime_size [2, 10000];
+    multivariate/prune_redundant/robust/level_shifts bool (exact type,
+    int rejected); regime_size [2, 10000];
     n_clusters [1, 1000]; corr_threshold/mv_threshold/evolve_drift [0, 1];
     context_order [0, 10]; mv_window [2, 10000]; max_period [2, 1000000].
     Bounds are inclusive.
