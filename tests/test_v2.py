@@ -221,11 +221,15 @@ def test_max_period_respected():
 
 
 def test_multivariate_end_index_flagged():
+    # NOTE (v2/D3): this test previously asserted the buggy behavior —
+    # index 30 reported twice (multivariate z=0.0 + statistical) for a
+    # univariate series. Per D3 a univariate series must not go through
+    # the multivariate detector and one event yields one record.
     out = Nexora().find_anomalies([10.0] * 30 + [25.0])
     idxs = [a["index"] for a in out["anomalies"]]
     assert max(idxs) == 30
-    mv = [a for a in out["anomalies"] if a["kind"] == "multivariate"]
-    assert mv and all(a["index"] == 30 for a in mv)
+    assert idxs == [30]
+    assert out["anomalies"][0]["kind"] == "statistical"
 
 
 def test_quality_still_fine():

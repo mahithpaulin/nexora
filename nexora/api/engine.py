@@ -203,6 +203,97 @@ def _stats(values):
     return {"mean": statistics.fmean(nums), "stdev": statistics.pstdev(nums) if len(nums) > 1 else 0.0, "count": len(nums)}
 
 
+_MATCH_THRESHOLD = 0.5
+
+
+def _overlap_features(row, pattern):
+    """Feature names where this row actually agrees with the pattern.
+
+    Only genuinely overlapping evidence is returned (value equality,
+    label membership in the pattern sequence) — never the pattern's
+    full feature-key list. Match explanations must cite real evidence
+    (D4), so this is computed from the same row/pattern pair that the
+    similarity verdict was computed from.
+    """
+    try:
+        feats = pattern.get("features", {}) if isinstance(pattern, dict) else {}
+    except Exception:
+        feats = {}
+    if not isinstance(feats, dict):
+        feats = {}
+    try:
+        seq = [str(x) for x in (pattern.get("sequence", []) or [])] if isinstance(pattern, dict) else []
+    except Exception:
+        seq = []
+    try:
+        lab = str(row.get("label", row.get("value", "")))
+    except Exception:
+        lab = ""
+    hit = []
+    try:
+        if "value" in feats and row.get("value") == feats.get("value"):
+            hit.append("value")
+    except Exception:
+        pass
+    if lab and lab in seq:
+        hit.append("sequence")
+    return hit
+
+
+def _merge_anomalies(out):
+    """Merge detector hits so one event yields one record (D3).
+
+    Groups by index, keeps the max score, unions kinds/causes, keeps a
+    statistical z-score when one was measured (else None — never a
+    fabricated 0.0), and regenerates the explanation from the merged
+    decision.
+    """
+    groups = {}
+    order = []
+    for a in out:
+        if not isinstance(a, dict):
+            continue
+        try:
+            idx = a.get("index", 0)
+        except Exception:
+            continue
+        if idx not in groups:
+            groups[idx] = []
+            order.append(idx)
+        groups[idx].append(a)
+    merged = []
+    for idx in order:
+        hits = groups[idx]
+        if len(hits) == 1:
+            merged.append(hits[0])
+            continue
+        kinds = sorted({str(h.get("kind", "unknown")) for h in hits})
+        try:
+            score = max(float(h.get("score", 0.0) or 0.0) for h in hits)
+        except (TypeError, ValueError):
+            score = 0.0
+        z = None
+        for h in hits:
+            if str(h.get("kind")) == "statistical" and isinstance(h.get("z"), (int, float)):
+                z = h["z"]
+                break
+        causes = []
+        for h in hits:
+            for c in h.get("causes", []) or []:
+                if c not in causes:
+                    causes.append(c)
+        val = hits[0].get("value")
+        expl = ("Merged %d detector hit(s) at index %s (value %s): kinds [%s]; "
+                "top score %.2f%s; causes: %s."
+                % (len(hits), idx, val, ", ".join(kinds), score,
+                   (" with z=%.2f" % z) if z is not None else "",
+                   "; ".join(str(c) for c in causes) or "none"))
+        merged.append({"index": idx, "value": val, "z": z, "score": score,
+                       "kind": "+".join(kinds), "causes": causes, "explanation": expl})
+    merged.sort(key=lambda d: (d.get("index", 0), str(d.get("kind", ""))))
+    return merged
+
+
 def _sim(row, pattern):
     """Similarity 0..1 of one row vs one pattern (sequence + numeric, deterministic).
 
@@ -681,12 +772,40 @@ class Nexora:
             except Exception:
                 pass
         pats = self.repo.all()
-        _mean = st.get("mean", 0.0)
+        # _stats() has two shapes: describe_series() -> {"n", "mean", ...}
+        # vs the fallback -> {"count", "mean", ...}. Numeric iff we have
+        # values AND a real mean (describe yields mean=None when empty).
         try:
-            _mean = float(_mean)
+            _n_num = int(st.get("count", 0) or st.get("n", 0) or 0)
         except (TypeError, ValueError):
-            _mean = 0.0
-        expl = "Discovered %d pattern(s) from %d observation(s) (mean %.3f)." % (len(pats), len(rows), _mean)
+            _n_num = 0
+        if _n_num and st.get("mean", None) is not None:
+            # Numeric input: a mean is meaningful — cite it with its base.
+            try:
+                _mean = float(st.get("mean", 0.0))
+            except (TypeError, ValueError):
+                _mean = 0.0
+            expl = ("Discovered %d pattern(s) from %d observation(s) "
+                    "(mean %.3f over %d numeric value(s))."
+                    % (len(pats), len(rows), _mean, _n_num))
+        else:
+            # Categorical input: a mean is meaningless (D1) — cite the
+            # mode, distinct-value count and entropy instead.
+            _cnt = collections.Counter(str(v) for v in values)
+            _n = len(values)
+            if _cnt and _n:
+                _mode, _mode_c = _cnt.most_common(1)[0]
+                try:
+                    import math as _m
+                    _ent = -sum((_c / _n) * _m.log2(_c / _n) for _c in _cnt.values())
+                except (ValueError, ZeroDivisionError):
+                    _ent = 0.0
+                expl = ("Discovered %d pattern(s) from %d observation(s); categorical values: "
+                        "mode '%s' (%d of %d), %d distinct value(s), entropy %.3f bits."
+                        % (len(pats), len(rows), _mode, _mode_c, _n, len(_cnt), _ent))
+            else:
+                expl = ("Discovered %d pattern(s) from %d observation(s); no values to summarize."
+                        % (len(pats), len(rows)))
         try:
             new_pats = [dict(_p) for _p in pats if str(_p.get("id")) not in ids_before]
         except Exception:
@@ -729,9 +848,10 @@ class Nexora:
         res = []
         for p in self.repo.all():
             s = _sim(row, p)
-            feats = list((p.get("features", {}) or {}).keys())
-            ev = explain_match(row, p.get("id"), s, feats) if explain_match else "similarity %.3f" % s
-            res.append({"pattern_id": p.get("id"), "similarity": s, "matched": s >= 0.5, "evidence": ev, "explanation": ev})
+            m = s >= _MATCH_THRESHOLD
+            feats = _overlap_features(row, p)
+            ev = explain_match(row, p.get("id"), s, feats, m, _MATCH_THRESHOLD) if explain_match else "similarity %.3f" % s
+            res.append({"pattern_id": p.get("id"), "similarity": s, "matched": m, "evidence": ev, "explanation": ev})
         res.sort(key=lambda d: (-d["similarity"], str(d["pattern_id"])))
         return res
 
@@ -747,13 +867,42 @@ class Nexora:
         rows = _rows(data)
         st = _stats([r["value"] for r in rows])
         zt = float(self.config.get("z_threshold", 3.0))
+        try:
+            _vocab = {str(r.get("label", r.get("value", ""))) for r in rows}
+        except Exception:
+            _vocab = set()
+        try:
+            _all_pats = self.repo.all()
+        except Exception:
+            _all_pats = []
+        # D2: only patterns sharing label vocabulary with the input are
+        # relevant. Unrelated history (e.g. ABC patterns vs a numeric
+        # series) must not make a flat series look "novel".
+        relevant = []
+        for _p in _all_pats:
+            if not isinstance(_p, dict):
+                continue
+            try:
+                _pseq = {str(x) for x in (_p.get("sequence", []) or [])}
+            except Exception:
+                continue
+            if _pseq & _vocab:
+                relevant.append(_p)
         if _anomaly_detect is not None:
-            out = _anomaly_detect(rows, st, zt, self.repo.all())
+            out = _anomaly_detect(rows, st, zt, relevant)
         else:
             out = [{"index": r["index"], "value": r["value"], "kind": "statistical", "score": 0.9,
                     "causes": ["z-threshold"], "explanation": "outlier"} for r in rows
                    if isinstance(r["value"], (int, float)) and st["stdev"] > 0 and abs((r["value"] - st["mean"]) / st["stdev"]) >= zt]
-        if self.config.get("multivariate", True) and detect_multivariate is not None and _embed_windows is not None:
+        try:
+            _raws = [r.get("raw") for r in rows if isinstance(r.get("raw"), dict)]
+            _ncols = len(_numeric_columns(_raws)) if _raws else 0
+        except Exception:
+            _ncols = 0
+        # D3: the multivariate detector only runs on genuinely
+        # multivariate input (>= 2 numeric columns). A univariate series
+        # must not go through it.
+        if _ncols >= 2 and self.config.get("multivariate", True) and detect_multivariate is not None and _embed_windows is not None:
             try:
                 pairs = [(r["index"], r["value"]) for r in rows
                          if isinstance(r.get("value"), (int, float)) and not isinstance(r.get("value"), bool)]
@@ -761,7 +910,7 @@ class Nexora:
                 if len(pairs) >= 2 * msize:
                     wvecs, wstarts = _embed_windows([v for _, v in pairs], msize)
                     if wvecs:
-                        mv = detect_multivariate(wvecs, threshold=float(self.config.get("mv_threshold", 0.9)))
+                        mv = detect_multivariate(wvecs, threshold=float(self.config.get("mv_threshold", 0.8)))
                         for a in mv.get("anomalies", []):
                             try:
                                 _ei = wstarts[a["index"]] + msize - 1
@@ -773,10 +922,10 @@ class Nexora:
                                     continue
                             ri = pairs[_ei][0]
                             rv = pairs[_ei][1]
-                            dims = mv.get("dims", msize)
-                            out.append({
-                                "index": ri, "value": rv, "z": 0.0, "score": a["score"],
-                                "kind": "multivariate",
+                    dims = mv.get("dims", msize)
+                    out.append({
+                        "index": ri, "value": rv, "z": None, "score": a["score"],
+                        "kind": "multivariate",
                                 "causes": ["window d2=%.2f over %d dims" % (a["d2"], dims)],
                                 "explanation": ("Multivariate outlier at window ending index %s: "
                                                 "Mahalanobis d2=%.2f across %d dims, score %.2f "
@@ -785,7 +934,8 @@ class Nexora:
                             })
             except Exception:
                 pass
-        out.sort(key=lambda d: (d.get("index", 0), d.get("kind", "")))
+        # D3: one event produces one record — merge same-index hits.
+        out = _merge_anomalies(out)
         expl = "Found %d anomalie(s) (z_threshold=%s)." % (len(out), zt)
         return {"anomalies": out, "count": len(out), "reason": expl, "explanation": expl, "evidence": {"stats": st}}
 
