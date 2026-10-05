@@ -4,9 +4,12 @@ All sibling discovery/feature/matching imports are guarded
 (try/except ImportError -> None); engine falls back to deterministic
 stdlib logic when a module is missing.
 """
+from __future__ import annotations
+
 import collections
 import os
 import statistics
+from typing import Any
 
 try:
     from nexora.ingestion.parser import parse as _parse_path
@@ -452,7 +455,7 @@ class Nexora:
     Internal algorithms may change. Config is validated fail-fast
     (InvalidConfigError, a ValueError) when nexora.core.config exists."""
 
-    def __init__(self, config=None):
+    def __init__(self, config: dict | None = None) -> None:
         if _validate_config is not None:
             self.config = _validate_config(config)
         else:
@@ -484,7 +487,7 @@ class Nexora:
             _cap0 = 1024
         self._history = collections.deque(maxlen=_cap0)
 
-    def _store(self, p):
+    def _store(self, p: dict) -> Any:
         pid = self.repo.add(p)
         stored = self.repo.get(pid)
         if _lc_advance is not None and isinstance(stored, dict):
@@ -608,7 +611,7 @@ class Nexora:
         self._trail.setdefault(pid, []).append(c)
         return pid
 
-    def discover(self, data, *, show_all=False):
+    def discover(self, data: Any, *, show_all: bool = False) -> dict:
         """Find recurring values + frequent sequences; store them; return evidence.
 
         Closed-pattern pruning (WS2) drops a recurring/sequential
@@ -1124,7 +1127,7 @@ class Nexora:
                 "evidence": ev, "new_patterns": new_pats,
                 "status": _status, "status_reason": _sreason}
 
-    def match(self, observation):
+    def match(self, observation: Any) -> list:
         """Rank all stored patterns by similarity to one observation."""
         row = _rows([observation])[0]
         res = []
@@ -1137,7 +1140,7 @@ class Nexora:
         res.sort(key=lambda d: (-d["similarity"], str(d["pattern_id"])))
         return res
 
-    def detect(self, data):
+    def detect(self, data: Any) -> dict:
         """discover + match in one pass over the data."""
         disc = self.discover(data)
         matches = [m for r in _rows(data) for m in self.match(r)]
@@ -1147,7 +1150,7 @@ class Nexora:
                 "status": disc.get("status", STATUS_FOUND),
                 "status_reason": "detect: " + str(disc.get("status_reason", disc.get("status", STATUS_FOUND)))}
 
-    def find_anomalies(self, data):
+    def find_anomalies(self, data: Any) -> dict:
         """Flag statistical outliers + novel/missing sequence transitions."""
         rows = _rows(data)
         st = _stats([r["value"] for r in rows])
@@ -1293,7 +1296,7 @@ class Nexora:
         return {"anomalies": out, "count": len(out), "reason": expl, "explanation": expl,
                 "evidence": {"stats": st}, "status": _status, "status_reason": _sreason}
 
-    def predict(self, data, current=None):
+    def predict(self, data: Any, current: Any = None) -> dict:
         """P(next|current) from bigram counts + backoff context model.
 
         predictions: first-order Markov (stable v0.1 field). context:
@@ -1459,7 +1462,7 @@ class Nexora:
                 "reason": expl, "explanation": expl, "evidence": {"matrix_states": states},
                 "status": _status, "status_reason": _sreason}
 
-    def predict_next(self, data, current=None):
+    def predict_next(self, data: Any, current: Any = None) -> dict:
         """Single best next symbol (v2 additive; does not alter predict()).
 
         Precedence: arithmetic when extrapolation kind != unknown and
@@ -1543,11 +1546,11 @@ class Nexora:
         return {"next": None, "probability": 0.0, "source": "none", "evidence": "no recorded transitions",
                 "status": STATUS_NONE, "status_reason": "NONE: no recorded transitions."}
 
-    def get_pattern(self, pid):
+    def get_pattern(self, pid: str) -> dict | None:
         """Return one stored pattern dict (or None)."""
         return self.repo.get(pid)
 
-    def get_history(self, pid):
+    def get_history(self, pid: str) -> dict:
         """Occurrences + confidence trail for one pattern."""
         p = self.repo.get(pid)
         if p is None:
@@ -1561,7 +1564,7 @@ class Nexora:
                 "status": STATUS_FOUND,
                 "status_reason": "FOUND: history for %s." % pid}
 
-    def explain(self, result):
+    def explain(self, result: Any) -> str:
         """Human-readable summary of any result dict."""
         if summarize_result is not None:
             try:
@@ -1570,7 +1573,7 @@ class Nexora:
                 pass
         return str(result)
 
-    def quality(self, data):
+    def quality(self, data: Any) -> dict:
         """Data-quality report: raw lists, or a file path (parsed, then raw values assessed).
 
         Never raises on ordinary data. Raises TypeError for non-list /
@@ -1597,7 +1600,7 @@ class Nexora:
             rep["status_reason"] = "FOUND: quality assessed over %d observation(s)." % _qn
         return rep
 
-    def report(self, result, fmt="markdown"):
+    def report(self, result: Any, fmt: str = "markdown") -> str:
         """Full human-readable report: fmt="markdown" (default) or "text".
 
         Never raises on malformed results (coerces with placeholders).
@@ -1610,7 +1613,7 @@ class Nexora:
             raise ImportError("nexora.explanation.report is required")
         return _render_markdown(result)
 
-    def save(self, path):
+    def save(self, path: Any) -> Any:
         """Persist engine state (config, patterns, trails) to path (atomic write).
 
         Returns path. Raises ImportError if store module missing, OSError
@@ -1620,7 +1623,7 @@ class Nexora:
             raise ImportError("nexora.memory.store is required")
         return _save_state(path, self.repo, trails=self._trail, config=self.config)
 
-    def load(self, path):
+    def load(self, path: Any) -> dict:
         """Load state saved by save(); replaces memory, trails, config.
 
         Returns {"patterns", "version", "reason"}. Raises
@@ -1646,7 +1649,7 @@ class Nexora:
                 "status": STATUS_FOUND,
                 "status_reason": "FOUND: state loaded."}
 
-    def batch(self, datasets):
+    def batch(self, datasets: Any) -> list:
         """Isolated detect() per dataset (fresh engine each); returns outcomes.
 
         One bad dataset records {"error": ...} and never kills the batch.
@@ -1657,7 +1660,7 @@ class Nexora:
             raise ImportError("nexora.api.batch is required")
         return _batch_process(datasets, self.config)
 
-    def update(self, data, *, detect_changes=True):
+    def update(self, data: Any, *, detect_changes: bool = True) -> dict:
         """Fold new observations into bounded incremental state (WS7).
 
         O(1) amortized per observation, O(window + vocab^2 + capacity)
@@ -1787,7 +1790,7 @@ class Nexora:
                 "status_reason": ("FOUND: streamed %d observation(s)." % len(rows)
                                   if rows else "NONE: empty chunk; state unchanged.")}
 
-    def stream_predict(self, current=None):
+    def stream_predict(self, current: Any = None) -> dict:
         """Next-symbol prediction from the incremental stream model (WS7).
 
         Same MLE math as the batch Markov path, over transition counts

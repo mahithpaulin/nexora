@@ -1,9 +1,9 @@
-"""Nexora engine-state persistence (Phase 6).
+"""Nexora engine-state persistence (schema v2).
 
-Schema v1 JSON object::
+Schema v2 JSON object::
 
     {
-      "version": 1,
+      "version": 2,
       "saved_at": "<UTC ISO-8601>",
       "config": {...},
       "patterns": [...],
@@ -11,11 +11,15 @@ Schema v1 JSON object::
       "extra": {...}
     }
 
-MIGRATION (documented): version-0 files shaped ``{counter, patterns}``
-(the v0.1 repo format, no ``version`` key) load successfully with
-``config={}``, ``trails={}``, ``extra={"migrated_from": 0}`` and
-``reason`` describing the migration. Unknown future versions (> 1)
-raise ``ValueError``. Missing keys default to empty containers.
+MIGRATION (documented): version-1 files (v1.x shape, patterns without
+the ``significance`` subdict, fewer config keys) load successfully
+and are normalized to version 2 with ``extra={"migrated_from": 1}``
+and a reason describing the migration; missing config keys are
+filled with current defaults by ``validate_config`` on engine load.
+Version-0 files shaped ``{counter, patterns}`` (the v0.1 repo
+format, no ``version`` key) migrate the same way with
+``config={}``, ``trails={}``. Unknown future versions (> 2) raise
+``ValueError``. Missing keys default to empty containers.
 
 Writes are atomic: payload goes to ``path + ".tmp"`` then
 ``os.replace`` onto ``path``, so a crash never leaves a half-written
@@ -26,7 +30,7 @@ import datetime
 import json
 import os
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _utc_now_iso():
@@ -183,7 +187,7 @@ def load_engine_state(path):
         if "patterns" in data and "counter" in data:
             pats = _as_pattern_list(data.get("patterns", []))
             return {
-                "version": 0,
+                "version": 2,
                 "config": {},
                 "patterns": pats,
                 "trails": {},
@@ -203,14 +207,21 @@ def load_engine_state(path):
         # Explicit version-0 file, same v0.1 shape.
         pats = _as_pattern_list(data.get("patterns", []))
         return {
-            "version": 0,
+            "version": 2,
             "config": {},
             "patterns": pats,
             "trails": {},
             "extra": {"migrated_from": 0},
             "reason": "migrated from version 0 (v0.1 repo format: {counter, patterns})",
         }
-    if ver != 1:
+
+    migrated_from = None
+    if ver == 1:
+        # MIGRATION: v1 files predate the significance subdict and the
+        # v2 config keys; patterns pass through untouched, config gaps
+        # are filled by validate_config on engine load.
+        migrated_from = 1
+    elif ver != 2:
         raise ValueError("unsupported state version {}".format(ver))
 
     cfg = data.get("config", {})
@@ -236,14 +247,19 @@ def load_engine_state(path):
     ext = data.get("extra", {})
     if not isinstance(ext, dict):
         ext = {}
-    reason = data.get("reason", "ok")
+    if migrated_from is not None:
+        ext = dict(ext)
+        ext["migrated_from"] = migrated_from
+        reason = "migrated from version %d to schema v2" % migrated_from
+    else:
+        reason = data.get("reason", "ok")
     if not isinstance(reason, str):
         try:
             reason = str(reason)
         except Exception:
             reason = "ok"
     return {
-        "version": 1,
+        "version": 2,
         "config": cfg,
         "patterns": pats,
         "trails": tr,

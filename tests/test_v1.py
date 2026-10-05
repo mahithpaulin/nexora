@@ -177,19 +177,22 @@ def test_store_roundtrip_and_migration(tmp_path):
     nx.save(f)
     with open(f) as fh:
         payload = json.load(fh)
-    assert payload["version"] == 1
+    # NOTE (v2/WS10): schema bumped 1 -> 2; save/load intent unchanged
+    # (roundtrip fidelity, v0 loads, future rejected).
+    assert payload["version"] == 2
     nx2 = Nexora()
     info = nx2.load(f)
     assert info["patterns"] == nx.repo.size() > 0
     assert nx2.get_pattern("P-001")["frequency"] == nx.get_pattern("P-001")["frequency"]
-    # v0 migration
+    # v0 migration (normalized to schema v2, provenance in extra).
     v0 = str(tmp_path / "v0.json")
     with open(v0, "w") as fh:
         json.dump({"counter": 2, "patterns": nx.repo.all()}, fh)
     mig = load_engine_state(v0)
-    assert mig["version"] == 0 and mig["trails"] == {}
+    assert mig["version"] == 2 and mig["trails"] == {}
+    assert mig["extra"]["migrated_from"] == 0
     info2 = nx2.load(v0)
-    assert info2["version"] == 0
+    assert info2["version"] == 2
     with pytest.raises(FileNotFoundError):
         load_engine_state(str(tmp_path / "nope.json"))
     fut = str(tmp_path / "fut.json")
