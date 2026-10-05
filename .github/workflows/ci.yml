@@ -25,3 +25,7 @@ jobs:
         run: python examples/eval_10.py
       - name: Run thorough evaluation (must be 30/30)
         run: python examples/eval_thorough.py
+      - name: Run evaluation harness (floors enforced, fails CI on drop)
+        run: python bench/run_bench.py
+      - name: Run scaling benchmark (fails CI on slope regression)
+        run: python bench/scaling.py
