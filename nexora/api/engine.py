@@ -77,6 +77,11 @@ try:
 except ImportError:
     _robust_detect = _level_shifts = _severity_of = None
 try:
+    from nexora.streaming import RunningStats as _RunningStats
+    from nexora.streaming import SlidingStats as _SlidingStats
+except ImportError:
+    _RunningStats = _SlidingStats = None
+try:
     from nexora.discovery.arithmetic import analyze_numeric_sequence as _analyze_seq
 except ImportError:
     _analyze_seq = None
@@ -140,6 +145,7 @@ DEFAULT_CONFIG = {"z_threshold": 3.0, "min_support": 3, "max_n": 3, "window": 20
                   "abstain_threshold": 0.5, "min_evidence": 2,
                   "significance": True, "sig_p_threshold": 0.05, "sig_min_lift": 1.5,
                   "sig_shuffles": 199, "sig_seed": 42, "sig_min_n": 30,
+                  "stream_capacity": 1024, "change_z": 6.0,
                   "evolve_drift": 0.4, "max_period": 256}
 
 
@@ -227,6 +233,12 @@ def _stats(values):
 
 
 _MATCH_THRESHOLD = 0.5
+
+#: Sentinel for "no previous streamed label yet" (WS7).
+_STREAM_UNSET = object()
+
+#: Cap on retained online change events (WS7 keeps memory bounded).
+_STREAM_CHANGES_CAP = 100
 
 
 def _overlap_features(row, pattern):
@@ -450,6 +462,21 @@ class Nexora:
         self._ctx = None
         self._lc_cfg = {"confirm_threshold": 3, "establish_freq": 10, "establish_confidence": 0.8,
                         "stale_after": 100, "retired_after": 200, "drift_threshold": 0.5}
+        # WS7 incremental streaming state: O(1)/O(window)/O(vocab^2),
+        # never the full history (history deque is capacity-capped).
+        self._stream_stats = None
+        self._stream_window = None
+        self._stream_trans = collections.Counter()
+        self._stream_totals = collections.Counter()
+        self._stream_prev = _STREAM_UNSET
+        self._stream_n = 0
+        self._stream_changes = []
+        self._stream_last_change = -10**12
+        try:
+            _cap0 = max(1, int((config or {}).get("stream_capacity", 1024)))
+        except (TypeError, ValueError, AttributeError):
+            _cap0 = 1024
+        self._history = collections.deque(maxlen=_cap0)
 
     def _store(self, p):
         pid = self.repo.add(p)
@@ -1462,3 +1489,157 @@ class Nexora:
         if _batch_process is None:
             raise ImportError("nexora.api.batch is required")
         return _batch_process(datasets, self.config)
+
+    def update(self, data, *, detect_changes=True):
+        """Fold new observations into bounded incremental state (WS7).
+
+        O(1) amortized per observation, O(window + vocab^2 + capacity)
+        memory: Welford running stats, a sliding window, bigram
+        transition counts, and a capacity-capped recent history. The
+        full history is NEVER reprocessed (update() never iterates
+        ``self._history``). Online change detection compares the full
+        trailing window mean against the long-run mean (|z| >=
+        change_z, one event per window cooldown) using past data only.
+
+        Returns {"processed", "total", "stats", "window", "changes"
+        (new events this call), "changes_total", "reason"}.
+        """
+        if _RunningStats is None or _SlidingStats is None:
+            raise ImportError("nexora.streaming is required")
+        import math as _math
+        try:
+            cap = max(1, int(self.config.get("stream_capacity", 1024)))
+        except (TypeError, ValueError):
+            cap = 1024
+        if self._history.maxlen != cap:
+            # Rebuild only when the capacity actually changed.
+            self._history = collections.deque(self._history, maxlen=cap)
+        if self._stream_stats is None:
+            self._stream_stats = _RunningStats()
+        try:
+            wsize = max(1, int(self.config.get("window", 20)))
+        except (TypeError, ValueError):
+            wsize = 20
+        if self._stream_window is None or self._stream_window.window != wsize:
+            self._stream_window = _SlidingStats(wsize)
+        try:
+            cz = float(self.config.get("change_z", 6.0))
+        except (TypeError, ValueError):
+            cz = 6.0
+        if not cz > 0:
+            cz = 6.0
+        rows = _rows(data)
+        new_changes = []
+        for r in rows:
+            v = r.get("value")
+            lab = r.get("label")
+            try:
+                lab_ok = lab is not None and lab == lab and hash(lab) is not None
+            except TypeError:
+                lab_ok = False
+            num_ok = (isinstance(v, (int, float)) and not isinstance(v, bool)
+                      and _math.isfinite(float(v)))
+            if num_ok and detect_changes:
+                try:
+                    x = float(v)
+                    if self._stream_window.n >= wsize and self._stream_stats.n >= 2 * wsize:
+                        wm = self._stream_window.mean
+                        lm = self._stream_stats.mean
+                        ls = self._stream_stats.stdev
+                        if wm is not None and lm is not None and ls is not None:
+                            if ls == 0.0:
+                                fire = wm != lm
+                                z = _math.inf if x > lm else (-_math.inf if x < lm else 0.0)
+                            else:
+                                se = ls / _math.sqrt(wsize)
+                                z = (wm - lm) / se if se > 0 else 0.0
+                                fire = abs(z) >= cz
+                            if fire and (self._stream_n - self._stream_last_change) >= wsize:
+                                score = 1.0 if z in (_math.inf, -_math.inf) else min(1.0, abs(z) / (cz * 2.0))
+                                ev = {"index": r.get("index"), "value": v, "z": z,
+                                      "score": score, "kind": "stream_change",
+                                      # index is per-call; stream_pos is global.
+                                      "stream_pos": self._stream_n,
+                                      "causes": ["window mean %.4g vs long-run mean %.4g "
+                                                 "(long stdev %.4g, |z|=%.2f >= %.2f)"
+                                                 % (wm, lm, ls, z, cz)],
+                                      "explanation": ("Online change at index %s (value %s): "
+                                                      "trailing-%d mean %.4g deviates |z|=%.2f "
+                                                      "from long-run mean %.4g (threshold %.2f)."
+                                                      % (r.get("index"), v, wsize, wm, z, lm, cz))}
+                                try:
+                                    ev["severity"] = _severity_of(score) if _severity_of else "high"
+                                except Exception:
+                                    ev["severity"] = "high"
+                                self._stream_changes.append(ev)
+                                if len(self._stream_changes) > _STREAM_CHANGES_CAP:
+                                    del self._stream_changes[:-_STREAM_CHANGES_CAP]
+                                self._stream_last_change = self._stream_n
+                                new_changes.append(ev)
+                except Exception:
+                    pass
+            try:
+                self._stream_stats.update(v)
+            except Exception:
+                pass
+            try:
+                self._stream_window.update(v)
+            except Exception:
+                pass
+            if lab_ok:
+                if self._stream_prev is not _STREAM_UNSET:
+                    try:
+                        self._stream_trans[(self._stream_prev, lab)] += 1
+                        self._stream_totals[self._stream_prev] += 1
+                    except TypeError:
+                        pass
+                self._stream_prev = lab
+            try:
+                r["stream_pos"] = self._stream_n
+            except Exception:
+                pass
+            self._history.append(r)
+            self._stream_n += 1
+        try:
+            _s = {"n": self._stream_stats.n, "mean": self._stream_stats.mean,
+                  "stdev": self._stream_stats.stdev, "missing": self._stream_stats.missing}
+        except Exception:
+            _s = {"n": 0, "mean": None, "stdev": None, "missing": 0}
+        try:
+            _w = {"window": self._stream_window.window, "n": self._stream_window.n,
+                  "mean": self._stream_window.mean, "stdev": self._stream_window.stdev}
+        except Exception:
+            _w = {"window": wsize, "n": 0, "mean": None, "stdev": None}
+        return {"processed": len(rows), "total": self._stream_n, "stats": _s,
+                "window": _w, "changes": new_changes,
+                "changes_total": len(self._stream_changes),
+                "reason": ("Streamed %d observation(s), %d total; %d new change(s), %d retained."
+                           % (len(rows), self._stream_n, len(new_changes),
+                              len(self._stream_changes)))}
+
+    def stream_predict(self, current=None):
+        """Next-symbol prediction from the incremental stream model (WS7).
+
+        Same MLE math as the batch Markov path, over transition counts
+        maintained by update() (no history scan). Returns {"current",
+        "predictions", "n", "reason"}; empty predictions when the
+        current label has no recorded outgoing transitions.
+        """
+        if build_transition_matrix is None or predict_next is None:
+            raise ImportError("nexora.prediction.markov is required")
+        cur = current if current is not None else self._stream_prev
+        if cur is _STREAM_UNSET:
+            cur = None
+        try:
+            matrix = {"states": sorted({a for a, _ in self._stream_trans} | {b for _, b in self._stream_trans},
+                                       key=str),
+                      "counts": dict(self._stream_trans), "probs": {}}
+        except Exception:
+            matrix = {"states": [], "counts": {}, "probs": {}}
+        try:
+            preds = predict_next(cur, matrix, top_k=3) if cur is not None else []
+        except Exception:
+            preds = []
+        return {"current": cur, "predictions": preds, "n": self._stream_n,
+                "reason": ("Stream model after %d observation(s): %d prediction(s) after '%s'."
+                           % (self._stream_n, len(preds), cur))}

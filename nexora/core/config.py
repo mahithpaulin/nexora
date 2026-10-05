@@ -45,6 +45,8 @@ DEFAULTS = {
     "sig_shuffles": 199,
     "sig_seed": 42,
     "sig_min_n": 30,
+    "stream_capacity": 1024,
+    "change_z": 6.0,
     "evolve_drift": 0.4,
     "max_period": 256,
 }
@@ -79,6 +81,8 @@ SCHEMA = {
     "sig_shuffles": (int, 1, 999),
     "sig_seed": (int, 0, 2**31 - 1),
     "sig_min_n": (int, 1, 10**6),
+    "stream_capacity": (int, 1, 10**6),
+    "change_z": ((float, int), 0.1, 100),
     "evolve_drift": ((float, int), 0, 1),
     "max_period": (int, 2, 10**6),
 }
@@ -111,6 +115,8 @@ KEY_DOCS = {
     "sig_shuffles": "Permutation shuffles per pattern (scales up for resolution), range [1, 999].",
     "sig_seed": "Seed for the permutation test, range [0, 2**31-1].",
     "sig_min_n": "Minimum labels before dropping (below: annotate only), range [1, 1000000].",
+    "stream_capacity": "Recent observations retained by update(), range [1, 1000000].",
+    "change_z": "Online change-detection |z| cutoff, range [0.1, 100].",
     "mv_window": "Multivariate window length, range [2, 10000].",
     "mv_threshold": "Multivariate agreement threshold, range [0, 1].",
     "evolve_drift": "Allowed drift per evolve step, range [0, 1].",
