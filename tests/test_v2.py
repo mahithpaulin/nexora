@@ -203,8 +203,11 @@ def test_predict_next_sources():
     c = nx.predict_next(list("ABCABCABC"))
     assert c["source"] in ("context", "markov") and c["next"] == "A" and c["probability"] == 1.0
     n = nx.predict_next([])
+    # NOTE (v2/WS5): predict_next now carries an explicit status alongside
+    # the legacy fields (additive, not a behavior change).
     assert n == {"next": None, "probability": 0.0, "source": "none",
-                 "evidence": "no recorded transitions"}
+                 "evidence": "no recorded transitions",
+                 "status": "NONE", "status_reason": "NONE: no recorded transitions."}
     m = build_transition_matrix(["A", "B", "A"])
     assert predict_next("A", m)[0]["next"] == "B"
     cm = build_context_model(list("ABCABC"), max_order=2)

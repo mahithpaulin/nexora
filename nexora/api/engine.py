@@ -146,6 +146,7 @@ DEFAULT_CONFIG = {"z_threshold": 3.0, "min_support": 3, "max_n": 3, "window": 20
                   "significance": True, "sig_p_threshold": 0.05, "sig_min_lift": 1.5,
                   "sig_shuffles": 199, "sig_seed": 42, "sig_min_n": 30,
                   "stream_capacity": 1024, "change_z": 6.0,
+                  "min_data_discover": 1, "min_data_anomalies": 2, "min_data_predict": 2,
                   "evolve_drift": 0.4, "max_period": 256}
 
 
@@ -233,6 +234,11 @@ def _stats(values):
 
 
 _MATCH_THRESHOLD = 0.5
+
+STATUS_FOUND = "FOUND"
+STATUS_NONE = "NONE"
+STATUS_INSUFFICIENT = "INSUFFICIENT_DATA"
+STATUS_LOW_CONF = "LOW_CONFIDENCE"
 
 #: Sentinel for "no previous streamed label yet" (WS7).
 _STREAM_UNSET = object()
@@ -616,9 +622,37 @@ class Nexora:
         st = _stats(values)
         min_sup = int(self.config.get("min_support", 3))
         try:
+            _min_d = max(1, int(self.config.get("min_data_discover", 1)))
+        except (TypeError, ValueError):
+            _min_d = 1
+        if len(rows) < _min_d:
+            _r = ("INSUFFICIENT_DATA: need >= %d observation(s), got %d; nothing examined."
+                  % (_min_d, len(rows)))
+            return {"patterns": [], "count": 0, "reason": _r, "explanation": _r,
+                    "evidence": {}, "new_patterns": [],
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        try:
             ids_before = set(str(_p.get("id")) for _p in self.repo.all() if isinstance(_p, dict))
         except Exception:
             ids_before = set()
+        # WS5: count what THIS call stores vs merges (repo.all() mixes
+        # history, so status is based on the call's own findings). The
+        # closure works on a COPY of ids_before; the original stays
+        # pristine for the new_patterns computation below.
+        _call_stat = {"stored": 0, "merged": 0}
+        _real_store = self._store
+
+        def _store_counted(p, _rs=_real_store, _cst=_call_stat, _seen=set(ids_before)):
+            _pid = _rs(p)
+            try:
+                if str(_pid) in _seen:
+                    _cst["merged"] += 1
+                else:
+                    _cst["stored"] += 1
+                    _seen.add(str(_pid))
+            except Exception:
+                _cst["stored"] += 1
+            return _pid
         _structural_ev = {}
         found = []
         if find_recurring_values is not None:
@@ -822,7 +856,7 @@ class Nexora:
         elif _to_store and show_all:
             _sig_ev["skipped"] = "show_all=True: stored unvetted."
         for _d in _to_store:
-            self._store(_d)
+            _store_counted(_d)
         nums = [v for v in values
                 if isinstance(v, (int, float)) and not isinstance(v, bool)]
         if self.config.get("regimes", True) and find_regimes is not None and len(nums) >= 16:
@@ -833,7 +867,7 @@ class Nexora:
                     feats = rp.get("features", {}) or {}
                     occ = list(rp.get("occurrences", []) or [])
                     cnt = int(feats.get("count", rp.get("frequency", 1)) or 1)
-                    self._store({"type": "regime",
+                    _store_counted({"type": "regime",
                                  "features": {"method": feats.get("method", "kmeans"),
                                               "cluster": feats.get("cluster"),
                                               "window": rsize, "count": cnt,
@@ -856,7 +890,7 @@ class Nexora:
                     for cp in cps:
                         feats = cp.get("features", {}) or {}
                         n = int(feats.get("n", cp.get("frequency", 0)) or 0)
-                        self._store({"type": "correlation",
+                        _store_counted({"type": "correlation",
                                      "features": {"a": feats.get("a"), "b": feats.get("b"),
                                                   "r": feats.get("r"), "strength": feats.get("strength"),
                                                   "n": n},
@@ -885,7 +919,7 @@ class Nexora:
                     for i in range(int(est["period"])):
                         v = dec["seasonal"][i]
                         sig.append(round(float(v), 4) if v is not None else None)
-                    self._store({"type": "seasonal",
+                    _store_counted({"type": "seasonal",
                                  "features": {"period": int(est["period"]),
                                               "seasonal_strength": dec.get("seasonal_strength", 0.0),
                                               "trend_strength": dec.get("trend_strength", 0.0)},
@@ -906,7 +940,7 @@ class Nexora:
                     for k, v in (sol.get("params", {}) or {}).items():
                         if isinstance(v, (int, float, str)):
                             feats[str(k)] = v
-                    self._store({"type": "arithmetic", "features": feats,
+                    _store_counted({"type": "arithmetic", "features": feats,
                                  "sequence": [nxt],
                                  "relationships": {}, "frequency": 1,
                                  "first_seen": None, "last_seen": None, "occurrences": [],
@@ -988,7 +1022,7 @@ class Nexora:
                                 except Exception:
                                     _rdrop = False
                             if not _rdrop:
-                                self._store(_rd)
+                                _store_counted(_rd)
                         except Exception:
                             continue
             except Exception:
@@ -1064,8 +1098,31 @@ class Nexora:
         except Exception:
             ev = {"stats": st, "skipped": {"multivariate": "n/a in discover (see find_anomalies)."},
                   "pruned": dict(_pruned_ev), "significance": dict(_sig_ev)}
+        # WS5: explicit status from this call's own findings.
+        _n_found = _call_stat["stored"] + _call_stat["merged"]
+        if _n_found > 0:
+            _sig_skip = _sig_ev.get("skipped") or ""
+            if "sig_min_n" in _sig_skip and not show_all \
+                    and self.config.get("significance", True):
+                _status = STATUS_LOW_CONF
+                _sreason = ("LOW_CONFIDENCE: %d pattern(s) stored but n=%d is below "
+                            "sig_min_n=%d, so none is significance-vetted."
+                            % (_n_found, len(labels), _sig_min_n))
+            else:
+                _status = STATUS_FOUND
+                _sreason = ("FOUND: %d pattern(s) stored (%d new, %d merged) from %d "
+                            "observation(s)." % (_n_found, _call_stat["stored"],
+                                                 _call_stat["merged"], len(rows)))
+        else:
+            _status = STATUS_NONE
+            _sreason = ("NONE: nothing stored from %d observation(s): %d sequential "
+                        "candidate(s) examined, %d pruned as redundant, %d failed "
+                        "significance (min_support=%d)."
+                        % (len(rows), len(_cands), _pruned_ev.get("dropped", 0),
+                           _sig_ev.get("dropped", 0), min_sup))
         return {"patterns": pats, "count": len(pats), "reason": expl, "explanation": expl,
-                "evidence": ev, "new_patterns": new_pats}
+                "evidence": ev, "new_patterns": new_pats,
+                "status": _status, "status_reason": _sreason}
 
     def match(self, observation):
         """Rank all stored patterns by similarity to one observation."""
@@ -1085,13 +1142,26 @@ class Nexora:
         disc = self.discover(data)
         matches = [m for r in _rows(data) for m in self.match(r)]
         expl = "detect: %d pattern(s), %d match(es) over %d observation(s)." % (disc.get("count", 0), len(matches), len(_rows(data)))
-        return {"patterns": disc.get("patterns", []), "matches": matches, "reason": expl, "explanation": expl, "evidence": disc.get("evidence", {})}
+        # WS5: detect reports discover's status (match adds no new claims).
+        return {"patterns": disc.get("patterns", []), "matches": matches, "reason": expl, "explanation": expl, "evidence": disc.get("evidence", {}),
+                "status": disc.get("status", STATUS_FOUND),
+                "status_reason": "detect: " + str(disc.get("status_reason", disc.get("status", STATUS_FOUND)))}
 
     def find_anomalies(self, data):
         """Flag statistical outliers + novel/missing sequence transitions."""
         rows = _rows(data)
         st = _stats([r["value"] for r in rows])
         zt = float(self.config.get("z_threshold", 3.0))
+        try:
+            _min_a = max(1, int(self.config.get("min_data_anomalies", 2)))
+        except (TypeError, ValueError):
+            _min_a = 2
+        if len(rows) < _min_a:
+            _r = ("INSUFFICIENT_DATA: need >= %d observation(s) for anomaly detection, got %d."
+                  % (_min_a, len(rows)))
+            return {"anomalies": [], "count": 0, "reason": _r, "explanation": _r,
+                    "evidence": {"stats": st}, "status": STATUS_INSUFFICIENT,
+                    "status_reason": _r}
         try:
             _vocab = {str(r.get("label", r.get("value", ""))) for r in rows}
         except Exception:
@@ -1214,7 +1284,14 @@ class Nexora:
         # D3: one event produces one record — merge same-index hits.
         out = _merge_anomalies(out)
         expl = "Found %d anomalie(s) (z_threshold=%s)." % (len(out), zt)
-        return {"anomalies": out, "count": len(out), "reason": expl, "explanation": expl, "evidence": {"stats": st}}
+        if out:
+            _status, _sreason = STATUS_FOUND, ("FOUND: %d anomalie(s) in %d observation(s)."
+                                                % (len(out), len(rows)))
+        else:
+            _status, _sreason = STATUS_NONE, ("NONE: no anomalies in %d observation(s) "
+                                               "(z_threshold=%s)." % (len(rows), zt))
+        return {"anomalies": out, "count": len(out), "reason": expl, "explanation": expl,
+                "evidence": {"stats": st}, "status": _status, "status_reason": _sreason}
 
     def predict(self, data, current=None):
         """P(next|current) from bigram counts + backoff context model.
@@ -1244,6 +1321,26 @@ class Nexora:
             mlabels = [_l for _l in labels if _keep_lab(_l)]
         except Exception:
             mlabels = list(labels)
+        try:
+            _min_p = max(1, int(self.config.get("min_data_predict", 2)))
+        except (TypeError, ValueError):
+            _min_p = 2
+        # INSUFFICIENT only when nothing is computable at all: too few
+        # labels for transitions AND too few numerics for extrapolation.
+        try:
+            _nvals_early = sum(1 for _r in _rows(data)
+                               if isinstance(_r.get("value"), (int, float))
+                               and not isinstance(_r.get("value"), bool))
+        except Exception:
+            _nvals_early = 0
+        if len(mlabels) < _min_p and _nvals_early < 3:
+            _r = ("INSUFFICIENT_DATA: need >= %d usable label(s) for prediction, got %d "
+                  "(and only %d numeric value(s), need 3 for extrapolation)."
+                  % (_min_p, len(mlabels), _nvals_early))
+            return {"current": None, "predictions": [], "context": [], "log_loss": None,
+                    "extrapolation": {}, "reason": _r, "explanation": _r,
+                    "evidence": {"matrix_states": []}, "status": STATUS_INSUFFICIENT,
+                    "status_reason": _r}
         if build_transition_matrix is not None:
             self._matrix = build_transition_matrix(mlabels)
             cur = current if current is not None else (mlabels[-1] if mlabels else None)
@@ -1317,9 +1414,50 @@ class Nexora:
                         extrap["seasonal"] = {"source": "seasonal", "next": [_phase], "period": _pp}
             except Exception:
                 pass
+        # WS5: explicit status from the top candidates (mirrors the
+        # predict_next abstain gates: thin evidence must not read FOUND).
+        _best_p, _best_tot = -1.0, 0
+        for _cand in (list(preds[:1]) + list(ctx_preds[:1])):
+            try:
+                if isinstance(_cand, dict):
+                    _p = float(_cand.get("probability", -1.0))
+                    _t = int(_cand.get("total", _cand.get("count", 0)))
+                    if _p > _best_p:
+                        _best_p, _best_tot = _p, _t
+            except (TypeError, ValueError):
+                pass
+        try:
+            _abst = float(self.config.get("abstain_threshold", 0.5))
+        except (TypeError, ValueError):
+            _abst = 0.5
+        try:
+            _min_ev = int(self.config.get("min_evidence", 2))
+        except (TypeError, ValueError):
+            _min_ev = 2
+        _has_extrap = isinstance(extrap, dict) and bool(
+            extrap.get("next") or extrap.get("trend")
+            or (extrap.get("seasonal") or {}).get("next")
+            or (extrap.get("kind") not in (None, "unknown") and extrap.get("next")))
+        if not preds and not ctx_preds and _has_extrap:
+            _status = STATUS_FOUND
+            _sreason = ("FOUND: closed-form extrapolation available "
+                        "(no Markov/context transitions from '%s')." % cur)
+        elif not preds and not ctx_preds:
+            _status = STATUS_NONE
+            _sreason = ("NONE: no recorded outgoing transitions from '%s'%s."
+                        % (cur, " (arithmetic extrapolation still available)" if _has_extrap else ""))
+        elif _best_p < _abst or _best_tot < _min_ev:
+            _status = STATUS_LOW_CONF
+            _sreason = ("LOW_CONFIDENCE: best P=%.3f (N=%d) below abstain_threshold=%.2f / "
+                        "min_evidence=%d after '%s'." % (_best_p, _best_tot, _abst, _min_ev, cur))
+        else:
+            _status = STATUS_FOUND
+            _sreason = ("FOUND: %d Markov + %d context candidate(s) after '%s' (best P=%.3f, N=%d)."
+                        % (len(preds), len(ctx_preds), cur, _best_p, _best_tot))
         return {"current": cur, "predictions": preds, "context": ctx_preds, "log_loss": log_loss,
                 "extrapolation": extrap,
-                "reason": expl, "explanation": expl, "evidence": {"matrix_states": states}}
+                "reason": expl, "explanation": expl, "evidence": {"matrix_states": states},
+                "status": _status, "status_reason": _sreason}
 
     def predict_next(self, data, current=None):
         """Single best next symbol (v2 additive; does not alter predict()).
@@ -1342,7 +1480,8 @@ class Nexora:
         try:
             _full = self.predict(data, current=current)
         except Exception:
-            return {"next": None, "probability": 0.0, "source": "none", "evidence": "no recorded transitions"}
+            return {"next": None, "probability": 0.0, "source": "none", "evidence": "no recorded transitions",
+                    "status": STATUS_NONE, "status_reason": "NONE: prediction failed; nothing recorded."}
         try:
             _ex = _full.get("extrapolation", {}) or {}
             if isinstance(_ex, dict) and _ex.get("kind") not in (None, "unknown") and _ex.get("next"):
@@ -1355,7 +1494,9 @@ class Nexora:
                     if _nxts:
                         return {"next": _nxts[0], "probability": max(0.0, min(1.0, _conf)),
                                 "source": "arithmetic",
-                                "evidence": "extrapolation kind %s confidence %.3f." % (_ex.get("kind"), _conf)}
+                                "evidence": "extrapolation kind %s confidence %.3f." % (_ex.get("kind"), _conf),
+                                "status": STATUS_FOUND,
+                                "status_reason": "FOUND: arithmetic extrapolation."}
         except Exception:
             pass
         try:
@@ -1389,12 +1530,18 @@ class Nexora:
                             "evidence": ("Abstained: top %s candidate '%s' has P=%.3f (N=%d), "
                                          "below abstain_threshold=%.2f / min_evidence=%d."
                                          % (_pick_s, _pick.get("next"), _pp, _tot,
-                                            _abstain_p, _min_ev))}
+                                            _abstain_p, _min_ev)),
+                            "status": STATUS_LOW_CONF,
+                            "status_reason": ("LOW_CONFIDENCE: abstained (P=%.3f, N=%d)."
+                                              % (_pp, _tot))}
                 return {"next": _pick.get("next"), "probability": _pp,
-                        "source": _pick_s, "evidence": str(_pick.get("evidence", ""))}
+                        "source": _pick_s, "evidence": str(_pick.get("evidence", "")),
+                        "status": STATUS_FOUND,
+                        "status_reason": "FOUND: %s prediction." % _pick_s}
         except Exception:
             pass
-        return {"next": None, "probability": 0.0, "source": "none", "evidence": "no recorded transitions"}
+        return {"next": None, "probability": 0.0, "source": "none", "evidence": "no recorded transitions",
+                "status": STATUS_NONE, "status_reason": "NONE: no recorded transitions."}
 
     def get_pattern(self, pid):
         """Return one stored pattern dict (or None)."""
@@ -1404,11 +1551,15 @@ class Nexora:
         """Occurrences + confidence trail for one pattern."""
         p = self.repo.get(pid)
         if p is None:
-            return {"pattern_id": pid, "occurrences": [], "confidence_trail": [], "reason": "Pattern not found."}
+            _r = "Pattern not found."
+            return {"pattern_id": pid, "occurrences": [], "confidence_trail": [], "reason": _r,
+                    "status": STATUS_NONE, "status_reason": "NONE: " + _r}
         occ = p.get("occurrences", []) if isinstance(p, dict) else _get(p, "occurrences", [])
         trail = list(self._trail.get(pid, [p.get("confidence", 0.5) if isinstance(p, dict) else 0.5]))
         return {"pattern_id": pid, "occurrences": occ, "confidence_trail": trail,
-                "reason": "History for %s: %d occurrence(s)." % (pid, len(occ))}
+                "reason": "History for %s: %d occurrence(s)." % (pid, len(occ)),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: history for %s." % pid}
 
     def explain(self, result):
         """Human-readable summary of any result dict."""
@@ -1429,8 +1580,22 @@ class Nexora:
             raise ImportError("nexora.ingestion.quality is required")
         if isinstance(data, os.PathLike) or _is_file_path(data):
             rows = _rows(data)
-            return _quality_report([r.get("raw") for r in rows])
-        return _quality_report(data)
+            rep = _quality_report([r.get("raw") for r in rows])
+        else:
+            rep = _quality_report(data)
+        if not isinstance(rep, dict):
+            return rep
+        try:
+            _qn = int(rep.get("n", 0) or 0)
+        except (TypeError, ValueError):
+            _qn = 0
+        if _qn == 0:
+            rep["status"] = STATUS_INSUFFICIENT
+            rep["status_reason"] = "INSUFFICIENT_DATA: no observations to assess."
+        else:
+            rep["status"] = STATUS_FOUND
+            rep["status_reason"] = "FOUND: quality assessed over %d observation(s)." % _qn
+        return rep
 
     def report(self, result, fmt="markdown"):
         """Full human-readable report: fmt="markdown" (default) or "text".
@@ -1477,7 +1642,9 @@ class Nexora:
             except Exception:
                 pass
         return {"patterns": self.repo.size(), "version": st.get("version"),
-                "reason": "Loaded %d pattern(s) (schema v%s)." % (self.repo.size(), st.get("version"))}
+                "reason": "Loaded %d pattern(s) (schema v%s)." % (self.repo.size(), st.get("version")),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: state loaded."}
 
     def batch(self, datasets):
         """Isolated detect() per dataset (fresh engine each); returns outcomes.
@@ -1615,7 +1782,10 @@ class Nexora:
                 "changes_total": len(self._stream_changes),
                 "reason": ("Streamed %d observation(s), %d total; %d new change(s), %d retained."
                            % (len(rows), self._stream_n, len(new_changes),
-                              len(self._stream_changes)))}
+                              len(self._stream_changes))),
+                "status": STATUS_FOUND if rows else STATUS_NONE,
+                "status_reason": ("FOUND: streamed %d observation(s)." % len(rows)
+                                  if rows else "NONE: empty chunk; state unchanged.")}
 
     def stream_predict(self, current=None):
         """Next-symbol prediction from the incremental stream model (WS7).
@@ -1642,4 +1812,7 @@ class Nexora:
             preds = []
         return {"current": cur, "predictions": preds, "n": self._stream_n,
                 "reason": ("Stream model after %d observation(s): %d prediction(s) after '%s'."
-                           % (self._stream_n, len(preds), cur))}
+                           % (self._stream_n, len(preds), cur)),
+                "status": STATUS_FOUND if preds else STATUS_NONE,
+                "status_reason": ("FOUND: stream predictions after '%s'." % cur
+                                  if preds else "NONE: no stream transitions from '%s'." % cur)}
