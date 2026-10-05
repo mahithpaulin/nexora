@@ -37,6 +37,8 @@ DEFAULTS = {
     "level_shifts": True,
     "ls_window": 10,
     "ls_threshold": 3.0,
+    "abstain_threshold": 0.5,
+    "min_evidence": 2,
     "evolve_drift": 0.4,
     "max_period": 256,
 }
@@ -63,6 +65,8 @@ SCHEMA = {
     "level_shifts": (bool, None, None),
     "ls_window": (int, 1, 10**4),
     "ls_threshold": ((float, int), 0.1, 100),
+    "abstain_threshold": ((float, int), 0, 1),
+    "min_evidence": (int, 1, 10**6),
     "evolve_drift": ((float, int), 0, 1),
     "max_period": (int, 2, 10**6),
 }
@@ -87,6 +91,8 @@ KEY_DOCS = {
     "level_shifts": "Enable mean-shift level-shift records if True; must be bool.",
     "ls_window": "Half-window for level-shift detection, range [1, 10000].",
     "ls_threshold": "Level-shift |z| cutoff, range [0.1, 100].",
+    "abstain_threshold": "predict_next abstains below this top probability, range [0, 1].",
+    "min_evidence": "predict_next abstains below this transition count, range [1, 1000000].",
     "mv_window": "Multivariate window length, range [2, 10000].",
     "mv_threshold": "Multivariate agreement threshold, range [0, 1].",
     "evolve_drift": "Allowed drift per evolve step, range [0, 1].",

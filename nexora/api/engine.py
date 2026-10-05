@@ -129,6 +129,7 @@ DEFAULT_CONFIG = {"z_threshold": 3.0, "min_support": 3, "max_n": 3, "window": 20
                   "multivariate": True, "mv_window": 5, "mv_threshold": 0.8,
                   "robust": True, "robust_window": 20, "robust_threshold": 3.5,
                   "level_shifts": True, "ls_window": 10, "ls_threshold": 3.0,
+                  "abstain_threshold": 0.5, "min_evidence": 2,
                   "evolve_drift": 0.4, "max_period": 256}
 
 
@@ -1174,8 +1175,19 @@ class Nexora:
 
         Precedence: arithmetic when extrapolation kind != unknown and
         confidence >= 0.9; else context top when its probability >= markov
-        top (ties go to context); else markov top; else none.
+        top (ties go to context); else markov top; else none. WS6: the
+        chosen statistical candidate is held to abstain_threshold /
+        min_evidence — below either, the engine abstains rather than
+        guessing (source "abstain", next None).
         """
+        try:
+            _abstain_p = float(self.config.get("abstain_threshold", 0.5))
+        except (TypeError, ValueError):
+            _abstain_p = 0.5
+        try:
+            _min_ev = int(self.config.get("min_evidence", 2))
+        except (TypeError, ValueError):
+            _min_ev = 2
         try:
             _full = self.predict(data, current=current)
         except Exception:
@@ -1209,11 +1221,26 @@ class Nexora:
             except (TypeError, ValueError):
                 _mp = -1.0
             if isinstance(_ct, dict) and _cp >= 0.0 and (not isinstance(_mt, dict) or _cp >= _mp):
-                return {"next": _ct.get("next"), "probability": max(0.0, min(1.0, _cp)),
-                        "source": "context", "evidence": str(_ct.get("evidence", ""))}
-            if isinstance(_mt, dict) and _mp >= 0.0:
-                return {"next": _mt.get("next"), "probability": max(0.0, min(1.0, _mp)),
-                        "source": "markov", "evidence": str(_mt.get("evidence", ""))}
+                _pick, _pick_p, _pick_s = _ct, _cp, "context"
+            elif isinstance(_mt, dict) and _mp >= 0.0:
+                _pick, _pick_p, _pick_s = _mt, _mp, "markov"
+            else:
+                _pick = None
+            if isinstance(_pick, dict):
+                try:
+                    _tot = _pick.get("total", _pick.get("count", _min_ev))
+                    _tot = int(_tot)
+                except (TypeError, ValueError):
+                    _tot = _min_ev
+                _pp = max(0.0, min(1.0, _pick_p))
+                if _pp < _abstain_p or _tot < _min_ev:
+                    return {"next": None, "probability": _pp, "source": "abstain",
+                            "evidence": ("Abstained: top %s candidate '%s' has P=%.3f (N=%d), "
+                                         "below abstain_threshold=%.2f / min_evidence=%d."
+                                         % (_pick_s, _pick.get("next"), _pp, _tot,
+                                            _abstain_p, _min_ev))}
+                return {"next": _pick.get("next"), "probability": _pp,
+                        "source": _pick_s, "evidence": str(_pick.get("evidence", ""))}
         except Exception:
             pass
         return {"next": None, "probability": 0.0, "source": "none", "evidence": "no recorded transitions"}
