@@ -29,8 +29,11 @@ try:
     from nexora.discovery.frequency import find_recurring_values
     from nexora.discovery.sequences import find_frequent_sequences
     from nexora.discovery.change_points import change_points
+    from nexora.discovery.prune import closed_keep as _closed_keep
+    from nexora.discovery.prune import is_contiguous_subsequence as _is_subseq
 except ImportError:
     find_recurring_values = find_frequent_sequences = change_points = None
+    _closed_keep = _is_subseq = None
 try:
     from nexora.matching.similarity import sequence_similarity, pearson_similarity, cosine_similarity
     from nexora.matching.distance import euclidean, normalized_similarity
@@ -113,6 +116,7 @@ except ImportError:
         explain_match = summarize_result = None
 
 DEFAULT_CONFIG = {"z_threshold": 3.0, "min_support": 3, "max_n": 3, "window": 20, "weights": {},
+                  "prune_redundant": True,
                   "regimes": True, "regime_size": 8, "n_clusters": 2,
                   "correlation": True, "corr_threshold": 0.7,
                   "seasonality": True, "context_order": 2,
@@ -551,8 +555,14 @@ class Nexora:
         self._trail.setdefault(pid, []).append(c)
         return pid
 
-    def discover(self, data):
-        """Find recurring values + frequent sequences; store them; return evidence."""
+    def discover(self, data, *, show_all=False):
+        """Find recurring values + frequent sequences; store them; return evidence.
+
+        Closed-pattern pruning (WS2) drops a recurring/sequential
+        candidate when a longer kept sequence contains it with the same
+        support-count. Pass show_all=True (or set config
+        prune_redundant=False) to store every candidate.
+        """
         rows = _rows(data)
         values = [r["value"] for r in rows]
         labels = [r["label"] for r in rows]
@@ -577,6 +587,7 @@ class Nexora:
             for val, c in cnt.items():
                 if c >= min_sup:
                     found.append({"value": val, "count": c, "indices": idxs[val]})
+        _cands = []  # (seq_key, count, store_dict); pruned below (WS2)
         for item in found:
             if isinstance(item, dict) and "features" in item:
                 feats = item.get("features", {}) or {}
@@ -590,11 +601,12 @@ class Nexora:
                 v = item.get("value") if isinstance(item, dict) else item
                 c = int(item.get("count", 1)) if isinstance(item, dict) else 1
                 occ = list(item.get("indices", [])) if isinstance(item, dict) else []
-            self._store({"type": "recurring_value", "features": {"value": v, "count": c}, "sequence": [v],
-                         "relationships": {}, "frequency": c, "first_seen": occ[0] if occ else None,
-                         "last_seen": occ[-1] if occ else None, "occurrences": occ,
-                         "confidence": min(1.0, 0.4 + 0.1 * c), "similarity": 1.0, "novelty": 0.0,
-                         "context": {"stats": st}, "metadata": {}, "state": "NEW"})
+            _cands.append((((str(v),), c,
+                            {"type": "recurring_value", "features": {"value": v, "count": c}, "sequence": [v],
+                             "relationships": {}, "frequency": c, "first_seen": occ[0] if occ else None,
+                             "last_seen": occ[-1] if occ else None, "occurrences": occ,
+                             "confidence": min(1.0, 0.4 + 0.1 * c), "similarity": 1.0, "novelty": 0.0,
+                             "context": {"stats": st}, "metadata": {}, "state": "NEW"})))
         seqs = []
         if find_frequent_sequences is not None:
             try:
@@ -616,11 +628,41 @@ class Nexora:
                 occ = list(s.get("occurrences", []) or [])
             else:
                 sup, occ = min_sup, []
-            self._store({"type": "frequent_sequence", "features": {"sequence": sq, "support": sup}, "sequence": sq,
-                         "relationships": {}, "frequency": sup, "first_seen": occ[0] if occ else None,
-                         "last_seen": occ[-1] if occ else None, "occurrences": occ,
-                         "confidence": min(1.0, 0.4 + 0.1 * sup),
-                         "similarity": 1.0, "novelty": 0.0, "context": {}, "metadata": {}, "state": "NEW"})
+            _cands.append(((tuple(str(x) for x in sq), sup,
+                            {"type": "frequent_sequence", "features": {"sequence": sq, "support": sup}, "sequence": sq,
+                             "relationships": {}, "frequency": sup, "first_seen": occ[0] if occ else None,
+                             "last_seen": occ[-1] if occ else None, "occurrences": occ,
+                             "confidence": min(1.0, 0.4 + 0.1 * sup),
+                             "similarity": 1.0, "novelty": 0.0, "context": {}, "metadata": {}, "state": "NEW"})))
+        _pruned_ev = {"kept": len(_cands), "dropped": 0, "details": []}
+        _to_store = [_d for _, _, _d in _cands]
+        _kept_seqs = []  # (seq_key, count) survivors; assoc rules prune against these
+        if _cands and self.config.get("prune_redundant", True) and not show_all \
+                and _closed_keep is not None and _is_subseq is not None:
+            try:
+                _flags = _closed_keep([(_k, _c) for _k, _c, _ in _cands], mode="closed")
+            except Exception:
+                _flags = [True] * len(_cands)
+            _kept = [t for t, _f in zip(_cands, _flags) if _f]
+            _dropped = [t for t, _f in zip(_cands, _flags) if not _f]
+            _details = []
+            for _k, _c, _ in _dropped:
+                _sup = None
+                for _kk, _kc, _ in _kept:
+                    try:
+                        if len(_kk) >= len(_k) and _kc == _c and _is_subseq(_k, _kk):
+                            _sup = list(_kk)
+                            break
+                    except Exception:
+                        continue
+                _details.append("%s subsumed by %s with equal support %d"
+                                % (list(_k), _sup, _c))
+            _to_store = [_d for _, _, _d in _kept]
+            _kept_seqs = [(_k, _c) for _k, _c, _ in _kept]
+            _pruned_ev = {"kept": len(_kept), "dropped": len(_dropped),
+                          "details": _details[:20]}
+        for _d in _to_store:
+            self._store(_d)
         nums = [v for v in values
                 if isinstance(v, (int, float)) and not isinstance(v, bool)]
         if self.config.get("regimes", True) and find_regimes is not None and len(nums) >= 16:
@@ -758,15 +800,35 @@ class Nexora:
                                 _cnt = int(_rl.get("count", min_sup) or min_sup)
                             except (TypeError, ValueError):
                                 _cnt = min_sup
-                            self._store({"type": "association",
-                                         "features": {"antecedent": _ant, "consequent": _con,
-                                                      "support": _sup, "confidence": _cnf},
-                                         "sequence": [_ant, _con],
-                                         "relationships": {}, "frequency": _cnt,
-                                         "first_seen": None, "last_seen": None, "occurrences": [],
-                                         "confidence": max(0.0, min(1.0, _cnf)),
-                                         "similarity": 1.0, "novelty": 0.0,
-                                         "context": {}, "metadata": {}, "state": "NEW"})
+                            _rd = {"type": "association",
+                                   "features": {"antecedent": _ant, "consequent": _con,
+                                                "support": _sup, "confidence": _cnf},
+                                   "sequence": [_ant, _con],
+                                   "relationships": {}, "frequency": _cnt,
+                                   "first_seen": None, "last_seen": None, "occurrences": [],
+                                   "confidence": max(0.0, min(1.0, _cnf)),
+                                   "similarity": 1.0, "novelty": 0.0,
+                                   "context": {}, "metadata": {}, "state": "NEW"}
+                            # WS2: an association rule adds nothing when a
+                            # kept sequential/recurring pattern with the same
+                            # support-count already covers its items.
+                            _rdrop = False
+                            if self.config.get("prune_redundant", True) and not show_all:
+                                try:
+                                    _ritems = {str(_ant), str(_con)}
+                                    for _kk, _kc in _kept_seqs:
+                                        if _kc == _cnt and _ritems <= set(_kk):
+                                            _pruned_ev["dropped"] += 1
+                                            if len(_pruned_ev["details"]) < 40:
+                                                _pruned_ev["details"].append(
+                                                    "%s rule subsumed by %s with equal support %d"
+                                                    % ([str(_ant), str(_con)], list(_kk), _cnt))
+                                            _rdrop = True
+                                            break
+                                except Exception:
+                                    _rdrop = False
+                            if not _rdrop:
+                                self._store(_rd)
                         except Exception:
                             continue
             except Exception:
@@ -836,9 +898,11 @@ class Nexora:
         except Exception:
             skipped = {"multivariate": "n/a in discover (see find_anomalies)."}
         try:
-            ev = {"stats": st, "structural": dict(_structural_ev), "skipped": dict(skipped)}
+            ev = {"stats": st, "structural": dict(_structural_ev),
+                  "skipped": dict(skipped), "pruned": dict(_pruned_ev)}
         except Exception:
-            ev = {"stats": st, "skipped": {"multivariate": "n/a in discover (see find_anomalies)."}}
+            ev = {"stats": st, "skipped": {"multivariate": "n/a in discover (see find_anomalies)."},
+                  "pruned": dict(_pruned_ev)}
         return {"patterns": pats, "count": len(pats), "reason": expl, "explanation": expl,
                 "evidence": ev, "new_patterns": new_pats}
 

@@ -20,6 +20,7 @@ DEFAULTS = {
     "max_n": 3,
     "window": 20,
     "weights": {},
+    "prune_redundant": True,
     "regimes": True,
     "regime_size": 8,
     "n_clusters": 2,
@@ -39,6 +40,7 @@ SCHEMA = {
     "max_n": (int, 2, 10),
     "window": (int, 1, 10**6),
     "weights": (dict, None, None),
+    "prune_redundant": (bool, None, None),
     "regimes": (bool, None, None),
     "regime_size": (int, 2, 10**4),
     "n_clusters": (int, 1, 10**3),
@@ -58,6 +60,7 @@ KEY_DOCS = {
     "max_n": "Maximum n-gram/order examined, range [2, 10].",
     "window": "Sliding window length for streaming stats, range [1, 1000000].",
     "weights": "Optional per-symbol weight map; must be a dict.",
+    "prune_redundant": "Drop sub-patterns subsumed by a longer pattern with equal support; must be bool.",
     "regimes": "Enable regime segmentation if True; must be bool.",
     "regime_size": "Minimum points per regime segment, range [2, 10000].",
     "n_clusters": "Number of clusters for regime grouping, range [1, 1000].",
@@ -76,7 +79,7 @@ def validate_config(d=None):
 
     Ranges: z_threshold [0.1, 10]; min_support [1, 1000000]; max_n [2, 10];
     window [1, 1000000]; weights dict; regimes/correlation/seasonality/
-    multivariate bool (exact type, int rejected); regime_size [2, 10000];
+    multivariate/prune_redundant bool (exact type, int rejected); regime_size [2, 10000];
     n_clusters [1, 1000]; corr_threshold/mv_threshold/evolve_drift [0, 1];
     context_order [0, 10]; mv_window [2, 10000]; max_period [2, 1000000].
     Bounds are inclusive.

@@ -248,7 +248,11 @@ def test_engine_quality_report_batch_prune():
     assert len(outs) == 2
     comp = compare_signatures(outs[0]["result"]["patterns"], outs[1]["result"]["patterns"])
     assert comp["added"] == comp["removed"] == []  # deterministic isolation
-    nx.discover(list("ABCABC"))
+    # NOTE (v2/WS2): closed pruning means plain discover() now stores ~1
+    # pattern here instead of a dozen redundant ones (D5). show_all=True
+    # restores the old unpruned stream so repo.prune() still has >3
+    # patterns to trim — which is what this test is actually about.
+    nx.discover(list("ABCABC"), show_all=True)
     for p in nx.repo.all():
         nx.repo.update(p["id"], {"state": "RETIRED"})
     before = nx.repo.size()

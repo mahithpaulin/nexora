@@ -1,4 +1,4 @@
-"""Nexora Core v0.1 demo on synthetic data.
+"""Nexora demo on synthetic data.
 
 Shows: (1) discovered patterns, (2) frequencies, (3) confidence,
 (4) observation similarity, (5) anomalies, (6) why each result happened.
@@ -12,7 +12,7 @@ sys.path.insert(0, ".")
 
 from nexora import Nexora
 
-print("=== NEXORA CORE v0.1 DEMO (non-neural, stdlib-only) ===\n")
+print("=== NEXORA DEMO (non-neural, stdlib-only) ===\n")
 
 # --- 1. Repeating categorical pattern with noise + missing value ---
 nx = Nexora(config={"min_support": 2, "max_n": 3, "z_threshold": 3.0})

@@ -186,7 +186,13 @@ def test_engine_skipped_evidence():
 def test_engine_structural_evidence():
     disc = Nexora(config={"min_support": 2}).discover(list("ABCABCABC"))
     assert disc["evidence"]["structural"]["nodes"] == 3
-    assoc = [p for p in disc["patterns"] if p["type"] == "association"]
+    # NOTE (v2/WS2): on pure ABC repeats every association rule is
+    # subsumed by the closed ABC pattern with equal support, so none is
+    # stored (D5). A rule that adds information beyond the sequences —
+    # A,B co-occurring across chunks without a frequent AB bigram —
+    # is still stored:
+    disc2 = Nexora(config={"min_support": 2}).discover(list("AXBAYB"))
+    assoc = [p for p in disc2["patterns"] if p["type"] == "association"]
     assert assoc and all(0.0 <= p["confidence"] <= 1.0 for p in assoc)
 
 
