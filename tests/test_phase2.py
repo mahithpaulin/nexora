@@ -268,11 +268,16 @@ def test_engine_relationships_attached():
 
 def test_engine_multivariate_anomaly():
     nx = Nexora()
+    # NOTE (v2/D3): this test previously asserted the buggy behavior —
+    # a *univariate* series going through the multivariate detector.
+    # Per D3 that path is now gated off, so the test uses genuinely
+    # multivariate input (two numeric columns, one joint outlier).
     # Constant baseline: inlier windows have d2 ~ 0 while the window
     # holding 25.0 scores ~0.84, cleanly above the 0.8 default threshold.
-    data = [10.0] * 30 + [25.0]
+    data = [{"value": 10.0, "aux": 1.0}] * 30 + [{"value": 25.0, "aux": 50.0}]
     out = nx.find_anomalies(data)
-    assert any(a["kind"] == "multivariate" for a in out["anomalies"])
+    assert any(a["kind"] == "multivariate" or "multivariate" in a["kind"]
+               for a in out["anomalies"])
 
 
 def test_engine_context_prediction():

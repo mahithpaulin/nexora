@@ -4,9 +4,12 @@ All sibling discovery/feature/matching imports are guarded
 (try/except ImportError -> None); engine falls back to deterministic
 stdlib logic when a module is missing.
 """
+from __future__ import annotations
+
 import collections
 import os
 import statistics
+from typing import Any
 
 try:
     from nexora.ingestion.parser import parse as _parse_path
@@ -29,8 +32,19 @@ try:
     from nexora.discovery.frequency import find_recurring_values
     from nexora.discovery.sequences import find_frequent_sequences
     from nexora.discovery.change_points import change_points
+    from nexora.discovery.prune import closed_keep as _closed_keep
+    from nexora.discovery.prune import is_contiguous_subsequence as _is_subseq
+    from nexora.discovery.significance import annotate as _sig_annotate
+    from nexora.discovery.significance import is_significant as _sig_decide
+    try:
+        from nexora.discovery.significance import annotation_stats as _sig_batch
+    except ImportError:
+        _sig_batch = None
 except ImportError:
     find_recurring_values = find_frequent_sequences = change_points = None
+    _closed_keep = _is_subseq = None
+    _sig_annotate = _sig_decide = None
+    _sig_batch = None
 try:
     from nexora.matching.similarity import sequence_similarity, pearson_similarity, cosine_similarity
     from nexora.matching.distance import euclidean, normalized_similarity
@@ -59,6 +73,17 @@ except ImportError:
     detect_multivariate = None
     _evo_snapshot = _evo_drift = None
     build_relationships = attach_relationships = None
+try:
+    from nexora.anomaly.robust import robust_detect as _robust_detect
+    from nexora.anomaly.robust import level_shift_records as _level_shifts
+    from nexora.anomaly.robust import severity_of as _severity_of
+except ImportError:
+    _robust_detect = _level_shifts = _severity_of = None
+try:
+    from nexora.streaming import RunningStats as _RunningStats
+    from nexora.streaming import SlidingStats as _SlidingStats
+except ImportError:
+    _RunningStats = _SlidingStats = None
 try:
     from nexora.discovery.arithmetic import analyze_numeric_sequence as _analyze_seq
 except ImportError:
@@ -113,10 +138,18 @@ except ImportError:
         explain_match = summarize_result = None
 
 DEFAULT_CONFIG = {"z_threshold": 3.0, "min_support": 3, "max_n": 3, "window": 20, "weights": {},
+                  "prune_redundant": True,
                   "regimes": True, "regime_size": 8, "n_clusters": 2,
                   "correlation": True, "corr_threshold": 0.7,
                   "seasonality": True, "context_order": 2,
                   "multivariate": True, "mv_window": 5, "mv_threshold": 0.8,
+                  "robust": True, "robust_window": 20, "robust_threshold": 3.5,
+                  "level_shifts": True, "ls_window": 10, "ls_threshold": 3.0,
+                  "abstain_threshold": 0.5, "min_evidence": 2,
+                  "significance": True, "sig_p_threshold": 0.05, "sig_min_lift": 1.5,
+                  "sig_shuffles": 199, "sig_seed": 42, "sig_min_n": 30,
+                  "stream_capacity": 1024, "change_z": 6.0,
+                  "min_data_discover": 1, "min_data_anomalies": 2, "min_data_predict": 2,
                   "evolve_drift": 0.4, "max_period": 256}
 
 
@@ -201,6 +234,109 @@ def _stats(values):
     if not nums:
         return {"mean": 0.0, "stdev": 0.0, "count": 0}
     return {"mean": statistics.fmean(nums), "stdev": statistics.pstdev(nums) if len(nums) > 1 else 0.0, "count": len(nums)}
+
+
+_MATCH_THRESHOLD = 0.5
+
+STATUS_FOUND = "FOUND"
+STATUS_NONE = "NONE"
+STATUS_INSUFFICIENT = "INSUFFICIENT_DATA"
+STATUS_LOW_CONF = "LOW_CONFIDENCE"
+
+#: Sentinel for "no previous streamed label yet" (WS7).
+_STREAM_UNSET = object()
+
+#: Cap on retained online change events (WS7 keeps memory bounded).
+_STREAM_CHANGES_CAP = 100
+
+
+def _overlap_features(row, pattern):
+    """Feature names where this row actually agrees with the pattern.
+
+    Only genuinely overlapping evidence is returned (value equality,
+    label membership in the pattern sequence) — never the pattern's
+    full feature-key list. Match explanations must cite real evidence
+    (D4), so this is computed from the same row/pattern pair that the
+    similarity verdict was computed from.
+    """
+    try:
+        feats = pattern.get("features", {}) if isinstance(pattern, dict) else {}
+    except Exception:
+        feats = {}
+    if not isinstance(feats, dict):
+        feats = {}
+    try:
+        seq = [str(x) for x in (pattern.get("sequence", []) or [])] if isinstance(pattern, dict) else []
+    except Exception:
+        seq = []
+    try:
+        lab = str(row.get("label", row.get("value", "")))
+    except Exception:
+        lab = ""
+    hit = []
+    try:
+        if "value" in feats and row.get("value") == feats.get("value"):
+            hit.append("value")
+    except Exception:
+        pass
+    if lab and lab in seq:
+        hit.append("sequence")
+    return hit
+
+
+def _merge_anomalies(out):
+    """Merge detector hits so one event yields one record (D3).
+
+    Groups by index, keeps the max score, unions kinds/causes, keeps a
+    statistical z-score when one was measured (else None — never a
+    fabricated 0.0), and regenerates the explanation from the merged
+    decision.
+    """
+    groups = {}
+    order = []
+    for a in out:
+        if not isinstance(a, dict):
+            continue
+        try:
+            idx = a.get("index", 0)
+        except Exception:
+            continue
+        if idx not in groups:
+            groups[idx] = []
+            order.append(idx)
+        groups[idx].append(a)
+    merged = []
+    for idx in order:
+        hits = groups[idx]
+        if len(hits) == 1:
+            merged.append(hits[0])
+            continue
+        kinds = sorted({str(h.get("kind", "unknown")) for h in hits})
+        try:
+            score = max(float(h.get("score", 0.0) or 0.0) for h in hits)
+        except (TypeError, ValueError):
+            score = 0.0
+        z = None
+        for h in hits:
+            if str(h.get("kind")) == "statistical" and isinstance(h.get("z"), (int, float)):
+                z = h["z"]
+                break
+        causes = []
+        for h in hits:
+            for c in h.get("causes", []) or []:
+                if c not in causes:
+                    causes.append(c)
+        val = hits[0].get("value")
+        expl = ("Merged %d detector hit(s) at index %s (value %s): kinds [%s]; "
+                "top score %.2f%s; causes: %s."
+                % (len(hits), idx, val, ", ".join(kinds), score,
+                   (" with z=%.2f" % z) if z is not None else "",
+                   "; ".join(str(c) for c in causes) or "none"))
+        merged.append({"index": idx, "value": val, "z": z, "score": score,
+                       "kind": "+".join(kinds), "causes": causes, "explanation": expl,
+                       "severity": _severity_of(score) if _severity_of else "high"})
+    merged.sort(key=lambda d: (d.get("index", 0), str(d.get("kind", ""))))
+    return merged
 
 
 def _sim(row, pattern):
@@ -319,7 +455,7 @@ class Nexora:
     Internal algorithms may change. Config is validated fail-fast
     (InvalidConfigError, a ValueError) when nexora.core.config exists."""
 
-    def __init__(self, config=None):
+    def __init__(self, config: dict | None = None) -> None:
         if _validate_config is not None:
             self.config = _validate_config(config)
         else:
@@ -335,8 +471,23 @@ class Nexora:
         self._ctx = None
         self._lc_cfg = {"confirm_threshold": 3, "establish_freq": 10, "establish_confidence": 0.8,
                         "stale_after": 100, "retired_after": 200, "drift_threshold": 0.5}
+        # WS7 incremental streaming state: O(1)/O(window)/O(vocab^2),
+        # never the full history (history deque is capacity-capped).
+        self._stream_stats = None
+        self._stream_window = None
+        self._stream_trans = collections.Counter()
+        self._stream_totals = collections.Counter()
+        self._stream_prev = _STREAM_UNSET
+        self._stream_n = 0
+        self._stream_changes = []
+        self._stream_last_change = -10**12
+        try:
+            _cap0 = max(1, int((config or {}).get("stream_capacity", 1024)))
+        except (TypeError, ValueError, AttributeError):
+            _cap0 = 1024
+        self._history = collections.deque(maxlen=_cap0)
 
-    def _store(self, p):
+    def _store(self, p: dict) -> Any:
         pid = self.repo.add(p)
         stored = self.repo.get(pid)
         if _lc_advance is not None and isinstance(stored, dict):
@@ -460,17 +611,51 @@ class Nexora:
         self._trail.setdefault(pid, []).append(c)
         return pid
 
-    def discover(self, data):
-        """Find recurring values + frequent sequences; store them; return evidence."""
+    def discover(self, data: Any, *, show_all: bool = False) -> dict:
+        """Find recurring values + frequent sequences; store them; return evidence.
+
+        Closed-pattern pruning (WS2) drops a recurring/sequential
+        candidate when a longer kept sequence contains it with the same
+        support-count. Pass show_all=True (or set config
+        prune_redundant=False) to store every candidate.
+        """
         rows = _rows(data)
         values = [r["value"] for r in rows]
         labels = [r["label"] for r in rows]
         st = _stats(values)
         min_sup = int(self.config.get("min_support", 3))
         try:
+            _min_d = max(1, int(self.config.get("min_data_discover", 1)))
+        except (TypeError, ValueError):
+            _min_d = 1
+        if len(rows) < _min_d:
+            _r = ("INSUFFICIENT_DATA: need >= %d observation(s), got %d; nothing examined."
+                  % (_min_d, len(rows)))
+            return {"patterns": [], "count": 0, "reason": _r, "explanation": _r,
+                    "evidence": {}, "new_patterns": [],
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        try:
             ids_before = set(str(_p.get("id")) for _p in self.repo.all() if isinstance(_p, dict))
         except Exception:
             ids_before = set()
+        # WS5: count what THIS call stores vs merges (repo.all() mixes
+        # history, so status is based on the call's own findings). The
+        # closure works on a COPY of ids_before; the original stays
+        # pristine for the new_patterns computation below.
+        _call_stat = {"stored": 0, "merged": 0}
+        _real_store = self._store
+
+        def _store_counted(p, _rs=_real_store, _cst=_call_stat, _seen=set(ids_before)):
+            _pid = _rs(p)
+            try:
+                if str(_pid) in _seen:
+                    _cst["merged"] += 1
+                else:
+                    _cst["stored"] += 1
+                    _seen.add(str(_pid))
+            except Exception:
+                _cst["stored"] += 1
+            return _pid
         _structural_ev = {}
         found = []
         if find_recurring_values is not None:
@@ -479,13 +664,17 @@ class Nexora:
             except Exception:
                 found = []
         if not found:
-            cnt = collections.Counter(str(v) for v in values)
+            cnt = collections.Counter(str(v) for v in values
+                                      if v is not None and v == v)
             idxs = {}
             for r in rows:
+                if r["value"] is None or r["value"] != r["value"]:
+                    continue
                 idxs.setdefault(str(r["value"]), []).append(r["index"])
             for val, c in cnt.items():
                 if c >= min_sup:
                     found.append({"value": val, "count": c, "indices": idxs[val]})
+        _cands = []  # (seq_key, count, store_dict); pruned below (WS2)
         for item in found:
             if isinstance(item, dict) and "features" in item:
                 feats = item.get("features", {}) or {}
@@ -499,11 +688,12 @@ class Nexora:
                 v = item.get("value") if isinstance(item, dict) else item
                 c = int(item.get("count", 1)) if isinstance(item, dict) else 1
                 occ = list(item.get("indices", [])) if isinstance(item, dict) else []
-            self._store({"type": "recurring_value", "features": {"value": v, "count": c}, "sequence": [v],
-                         "relationships": {}, "frequency": c, "first_seen": occ[0] if occ else None,
-                         "last_seen": occ[-1] if occ else None, "occurrences": occ,
-                         "confidence": min(1.0, 0.4 + 0.1 * c), "similarity": 1.0, "novelty": 0.0,
-                         "context": {"stats": st}, "metadata": {}, "state": "NEW"})
+            _cands.append((((str(v),), c,
+                            {"type": "recurring_value", "features": {"value": v, "count": c}, "sequence": [v],
+                             "relationships": {}, "frequency": c, "first_seen": occ[0] if occ else None,
+                             "last_seen": occ[-1] if occ else None, "occurrences": occ,
+                             "confidence": min(1.0, 0.4 + 0.1 * c), "similarity": 1.0, "novelty": 0.0,
+                             "context": {"stats": st}, "metadata": {}, "state": "NEW"})))
         seqs = []
         if find_frequent_sequences is not None:
             try:
@@ -512,24 +702,164 @@ class Nexora:
                 seqs = []
         if not seqs and len(labels) > 1:
             for (a, b), c in collections.Counter(zip(labels, labels[1:])).items():
-                if c >= min_sup:
+                # Missing labels never form patterns (None/NaN skipped).
+                if c >= min_sup and a is not None and b is not None and a == a and b == b:
                     seqs.append({"sequence": [a, b], "support": c})
         for s in seqs:
             sq = list(s.get("sequence", [])) if isinstance(s, dict) else list(s)
+            # Missing labels never form patterns (fixes a [None, None]
+            # artifact with a misread support that predates v2).
+            if sq and all(_x is None or _x != _x for _x in sq):
+                continue
             if isinstance(s, dict):
                 feats = s.get("features", {}) or {}
                 try:
-                    sup = int(feats.get("count", s.get("frequency", min_sup)) or min_sup)
+                    sup = int(feats.get("count", s.get("frequency", s.get("support", min_sup)))
+                              or min_sup)
                 except (TypeError, ValueError):
                     sup = min_sup
                 occ = list(s.get("occurrences", []) or [])
             else:
                 sup, occ = min_sup, []
-            self._store({"type": "frequent_sequence", "features": {"sequence": sq, "support": sup}, "sequence": sq,
-                         "relationships": {}, "frequency": sup, "first_seen": occ[0] if occ else None,
-                         "last_seen": occ[-1] if occ else None, "occurrences": occ,
-                         "confidence": min(1.0, 0.4 + 0.1 * sup),
-                         "similarity": 1.0, "novelty": 0.0, "context": {}, "metadata": {}, "state": "NEW"})
+            _cands.append(((tuple(str(x) for x in sq), sup,
+                            {"type": "frequent_sequence", "features": {"sequence": sq, "support": sup}, "sequence": sq,
+                             "relationships": {}, "frequency": sup, "first_seen": occ[0] if occ else None,
+                             "last_seen": occ[-1] if occ else None, "occurrences": occ,
+                             "confidence": min(1.0, 0.4 + 0.1 * sup),
+                             "similarity": 1.0, "novelty": 0.0, "context": {}, "metadata": {}, "state": "NEW"})))
+        _pruned_ev = {"kept": len(_cands), "dropped": 0, "details": []}
+        _to_store = [_d for _, _, _d in _cands]
+        _kept_seqs = []  # (seq_key, count) survivors; assoc rules prune against these
+        if _cands and self.config.get("prune_redundant", True) and not show_all \
+                and _closed_keep is not None and _is_subseq is not None:
+            try:
+                _flags = _closed_keep([(_k, _c) for _k, _c, _ in _cands], mode="closed")
+            except Exception:
+                _flags = [True] * len(_cands)
+            _kept = [t for t, _f in zip(_cands, _flags) if _f]
+            _dropped = [t for t, _f in zip(_cands, _flags) if not _f]
+            _details = []
+            for _k, _c, _ in _dropped:
+                _sup = None
+                for _kk, _kc, _ in _kept:
+                    try:
+                        if len(_kk) >= len(_k) and _kc == _c and _is_subseq(_k, _kk):
+                            _sup = list(_kk)
+                            break
+                    except Exception:
+                        continue
+                _details.append("%s subsumed by %s with equal support %d"
+                                % (list(_k), _sup, _c))
+            _to_store = [_d for _, _, _d in _kept]
+            _kept_seqs = [(_k, _c) for _k, _c, _ in _kept]
+            _pruned_ev = {"kept": len(_kept), "dropped": len(_dropped),
+                          "details": _details[:20]}
+        # WS3: significance — annotate every candidate with its null
+        # baseline (expected support, lift, permutation p-value) and drop
+        # sequential patterns that could easily occur by chance. The
+        # per-pattern threshold is Bonferroni-corrected over the
+        # candidate set, and shuffles scale up until the p-value
+        # resolution reaches it. Filtering needs powered data
+        # (n >= sig_min_n); below that we annotate but drop nothing.
+        # show_all=True stores everything unvetted. Singletons are never
+        # dropped (their shuffle null is degenerate by construction).
+        try:
+            _sig_thr = float(self.config.get("sig_p_threshold", 0.05))
+        except (TypeError, ValueError):
+            _sig_thr = 0.05
+        try:
+            _sig_lift = float(self.config.get("sig_min_lift", 1.5))
+        except (TypeError, ValueError):
+            _sig_lift = 1.5
+        try:
+            _sig_nsh = max(1, int(self.config.get("sig_shuffles", 199)))
+        except (TypeError, ValueError):
+            _sig_nsh = 199
+        try:
+            _sig_seed = int(self.config.get("sig_seed", 42))
+        except (TypeError, ValueError):
+            _sig_seed = 42
+        try:
+            _sig_min_n = max(1, int(self.config.get("sig_min_n", 30)))
+        except (TypeError, ValueError):
+            _sig_min_n = 30
+        _sig_ev = {"annotated": 0, "dropped": 0, "details": [], "skipped": None,
+                   "thresholds": {"p": _sig_thr, "lift": _sig_lift,
+                                  "shuffles": _sig_nsh, "seed": _sig_seed,
+                                  "min_n": _sig_min_n, "alpha_effective": None}}
+        if _to_store and not show_all and self.config.get("significance", True) \
+                and _sig_annotate is not None and _sig_decide is not None:
+            try:
+                _multi = sum(1 for _d in _to_store if len(_d.get("sequence", []) or []) >= 2)
+                _alpha = _sig_thr / max(1, _multi)
+                _sig_ev["thresholds"]["alpha_effective"] = _alpha
+                _nsh = _sig_nsh
+                while 1.0 / (1.0 + _nsh) > _alpha and _nsh < 999:
+                    _nsh = min(999, _nsh * 2 + 1)
+                _sig_ev["thresholds"]["shuffles"] = _nsh
+                _ann_fn = _sig_batch if _sig_batch is not None else _sig_annotate
+                _ann = _ann_fn([dict(_d) for _d in _to_store], labels,
+                               n_shuffles=_nsh, seed=_sig_seed, max_patterns=500)
+                _by_seq = {}
+                for _a in _ann or []:
+                    try:
+                        _by_seq.setdefault(tuple(str(_x) for _x in (_a.get("sequence", []) or [])), _a)
+                    except Exception:
+                        continue
+                _sigged = []
+                for _d in _to_store:
+                    try:
+                        _key = tuple(str(_x) for _x in (_d.get("sequence", []) or []))
+                        _a = _by_seq.get(_key, {})
+                        # Method metadata lives OUTSIDE features so drift
+                        # snapshots (and dedupe signatures) compare only
+                        # the phenomenon, not our statistics about it.
+                        _nd = dict(_d)
+                        _nd["significance"] = {
+                            "expected_support": float(_a.get("expected_support", 0.0)),
+                            "lift": float(_a.get("lift", 1.0)),
+                            "p_value": float(_a.get("p_value", 1.0)),
+                        }
+                        _sigged.append(_nd)
+                    except Exception:
+                        _sigged.append(_d)
+                _sig_ev["annotated"] = len(_sigged)
+                if len(labels) < _sig_min_n:
+                    _sig_ev["skipped"] = ("n=%d below sig_min_n=%d: annotated only, nothing dropped."
+                                          % (len(labels), _sig_min_n))
+                    _to_store = _sigged
+                elif len(_to_store) > 500:
+                    _sig_ev["skipped"] = ("too many candidates (%d > 500): annotated only."
+                                          % len(_to_store))
+                    _to_store = _sigged
+                else:
+                    _kept2 = []
+                    for _d in _sigged:
+                        _sq = list(_d.get("sequence", []) or [])
+                        if len(_sq) >= 2:
+                            try:
+                                _sg = _d.get("significance", {}) or {}
+                                _ok, _why = _sig_decide(_sg.get("p_value", 1.0),
+                                                        _sg.get("lift", 1.0),
+                                                        _d.get("frequency", 0),
+                                                        min_support=min_sup,
+                                                        p_threshold=_alpha,
+                                                        min_lift=_sig_lift)
+                            except Exception:
+                                _ok, _why = True, "significance check errored; kept."
+                            if not _ok:
+                                _sig_ev["dropped"] += 1
+                                if len(_sig_ev["details"]) < 20:
+                                    _sig_ev["details"].append("%s dropped: %s" % (_sq, _why))
+                                continue
+                        _kept2.append(_d)
+                    _to_store = _kept2
+            except Exception as _se:
+                _sig_ev["skipped"] = "significance errored (%s); stored unvetted." % type(_se).__name__
+        elif _to_store and show_all:
+            _sig_ev["skipped"] = "show_all=True: stored unvetted."
+        for _d in _to_store:
+            _store_counted(_d)
         nums = [v for v in values
                 if isinstance(v, (int, float)) and not isinstance(v, bool)]
         if self.config.get("regimes", True) and find_regimes is not None and len(nums) >= 16:
@@ -540,7 +870,7 @@ class Nexora:
                     feats = rp.get("features", {}) or {}
                     occ = list(rp.get("occurrences", []) or [])
                     cnt = int(feats.get("count", rp.get("frequency", 1)) or 1)
-                    self._store({"type": "regime",
+                    _store_counted({"type": "regime",
                                  "features": {"method": feats.get("method", "kmeans"),
                                               "cluster": feats.get("cluster"),
                                               "window": rsize, "count": cnt,
@@ -563,7 +893,7 @@ class Nexora:
                     for cp in cps:
                         feats = cp.get("features", {}) or {}
                         n = int(feats.get("n", cp.get("frequency", 0)) or 0)
-                        self._store({"type": "correlation",
+                        _store_counted({"type": "correlation",
                                      "features": {"a": feats.get("a"), "b": feats.get("b"),
                                                   "r": feats.get("r"), "strength": feats.get("strength"),
                                                   "n": n},
@@ -592,7 +922,7 @@ class Nexora:
                     for i in range(int(est["period"])):
                         v = dec["seasonal"][i]
                         sig.append(round(float(v), 4) if v is not None else None)
-                    self._store({"type": "seasonal",
+                    _store_counted({"type": "seasonal",
                                  "features": {"period": int(est["period"]),
                                               "seasonal_strength": dec.get("seasonal_strength", 0.0),
                                               "trend_strength": dec.get("trend_strength", 0.0)},
@@ -613,7 +943,7 @@ class Nexora:
                     for k, v in (sol.get("params", {}) or {}).items():
                         if isinstance(v, (int, float, str)):
                             feats[str(k)] = v
-                    self._store({"type": "arithmetic", "features": feats,
+                    _store_counted({"type": "arithmetic", "features": feats,
                                  "sequence": [nxt],
                                  "relationships": {}, "frequency": 1,
                                  "first_seen": None, "last_seen": None, "occurrences": [],
@@ -667,26 +997,74 @@ class Nexora:
                                 _cnt = int(_rl.get("count", min_sup) or min_sup)
                             except (TypeError, ValueError):
                                 _cnt = min_sup
-                            self._store({"type": "association",
-                                         "features": {"antecedent": _ant, "consequent": _con,
-                                                      "support": _sup, "confidence": _cnf},
-                                         "sequence": [_ant, _con],
-                                         "relationships": {}, "frequency": _cnt,
-                                         "first_seen": None, "last_seen": None, "occurrences": [],
-                                         "confidence": max(0.0, min(1.0, _cnf)),
-                                         "similarity": 1.0, "novelty": 0.0,
-                                         "context": {}, "metadata": {}, "state": "NEW"})
+                            _rd = {"type": "association",
+                                   "features": {"antecedent": _ant, "consequent": _con,
+                                                "support": _sup, "confidence": _cnf},
+                                   "sequence": [_ant, _con],
+                                   "relationships": {}, "frequency": _cnt,
+                                   "first_seen": None, "last_seen": None, "occurrences": [],
+                                   "confidence": max(0.0, min(1.0, _cnf)),
+                                   "similarity": 1.0, "novelty": 0.0,
+                                   "context": {}, "metadata": {}, "state": "NEW"}
+                            # WS2: an association rule adds nothing when a
+                            # kept sequential/recurring pattern with the same
+                            # support-count already covers its items.
+                            _rdrop = False
+                            if self.config.get("prune_redundant", True) and not show_all:
+                                try:
+                                    _ritems = {str(_ant), str(_con)}
+                                    for _kk, _kc in _kept_seqs:
+                                        if _kc == _cnt and _ritems <= set(_kk):
+                                            _pruned_ev["dropped"] += 1
+                                            if len(_pruned_ev["details"]) < 40:
+                                                _pruned_ev["details"].append(
+                                                    "%s rule subsumed by %s with equal support %d"
+                                                    % ([str(_ant), str(_con)], list(_kk), _cnt))
+                                            _rdrop = True
+                                            break
+                                except Exception:
+                                    _rdrop = False
+                            if not _rdrop:
+                                _store_counted(_rd)
                         except Exception:
                             continue
             except Exception:
                 pass
         pats = self.repo.all()
-        _mean = st.get("mean", 0.0)
+        # _stats() has two shapes: describe_series() -> {"n", "mean", ...}
+        # vs the fallback -> {"count", "mean", ...}. Numeric iff we have
+        # values AND a real mean (describe yields mean=None when empty).
         try:
-            _mean = float(_mean)
+            _n_num = int(st.get("count", 0) or st.get("n", 0) or 0)
         except (TypeError, ValueError):
-            _mean = 0.0
-        expl = "Discovered %d pattern(s) from %d observation(s) (mean %.3f)." % (len(pats), len(rows), _mean)
+            _n_num = 0
+        if _n_num and st.get("mean", None) is not None:
+            # Numeric input: a mean is meaningful — cite it with its base.
+            try:
+                _mean = float(st.get("mean", 0.0))
+            except (TypeError, ValueError):
+                _mean = 0.0
+            expl = ("Discovered %d pattern(s) from %d observation(s) "
+                    "(mean %.3f over %d numeric value(s))."
+                    % (len(pats), len(rows), _mean, _n_num))
+        else:
+            # Categorical input: a mean is meaningless (D1) — cite the
+            # mode, distinct-value count and entropy instead.
+            _cnt = collections.Counter(str(v) for v in values)
+            _n = len(values)
+            if _cnt and _n:
+                _mode, _mode_c = _cnt.most_common(1)[0]
+                try:
+                    import math as _m
+                    _ent = -sum((_c / _n) * _m.log2(_c / _n) for _c in _cnt.values())
+                except (ValueError, ZeroDivisionError):
+                    _ent = 0.0
+                expl = ("Discovered %d pattern(s) from %d observation(s); categorical values: "
+                        "mode '%s' (%d of %d), %d distinct value(s), entropy %.3f bits."
+                        % (len(pats), len(rows), _mode, _mode_c, _n, len(_cnt), _ent))
+            else:
+                expl = ("Discovered %d pattern(s) from %d observation(s); no values to summarize."
+                        % (len(pats), len(rows)))
         try:
             new_pats = [dict(_p) for _p in pats if str(_p.get("id")) not in ids_before]
         except Exception:
@@ -717,43 +1095,112 @@ class Nexora:
         except Exception:
             skipped = {"multivariate": "n/a in discover (see find_anomalies)."}
         try:
-            ev = {"stats": st, "structural": dict(_structural_ev), "skipped": dict(skipped)}
+            ev = {"stats": st, "structural": dict(_structural_ev),
+                  "skipped": dict(skipped), "pruned": dict(_pruned_ev),
+                  "significance": dict(_sig_ev)}
         except Exception:
-            ev = {"stats": st, "skipped": {"multivariate": "n/a in discover (see find_anomalies)."}}
+            ev = {"stats": st, "skipped": {"multivariate": "n/a in discover (see find_anomalies)."},
+                  "pruned": dict(_pruned_ev), "significance": dict(_sig_ev)}
+        # WS5: explicit status from this call's own findings.
+        _n_found = _call_stat["stored"] + _call_stat["merged"]
+        if _n_found > 0:
+            _sig_skip = _sig_ev.get("skipped") or ""
+            if "sig_min_n" in _sig_skip and not show_all \
+                    and self.config.get("significance", True):
+                _status = STATUS_LOW_CONF
+                _sreason = ("LOW_CONFIDENCE: %d pattern(s) stored but n=%d is below "
+                            "sig_min_n=%d, so none is significance-vetted."
+                            % (_n_found, len(labels), _sig_min_n))
+            else:
+                _status = STATUS_FOUND
+                _sreason = ("FOUND: %d pattern(s) stored (%d new, %d merged) from %d "
+                            "observation(s)." % (_n_found, _call_stat["stored"],
+                                                 _call_stat["merged"], len(rows)))
+        else:
+            _status = STATUS_NONE
+            _sreason = ("NONE: nothing stored from %d observation(s): %d sequential "
+                        "candidate(s) examined, %d pruned as redundant, %d failed "
+                        "significance (min_support=%d)."
+                        % (len(rows), len(_cands), _pruned_ev.get("dropped", 0),
+                           _sig_ev.get("dropped", 0), min_sup))
         return {"patterns": pats, "count": len(pats), "reason": expl, "explanation": expl,
-                "evidence": ev, "new_patterns": new_pats}
+                "evidence": ev, "new_patterns": new_pats,
+                "status": _status, "status_reason": _sreason}
 
-    def match(self, observation):
+    def match(self, observation: Any) -> list:
         """Rank all stored patterns by similarity to one observation."""
         row = _rows([observation])[0]
         res = []
         for p in self.repo.all():
             s = _sim(row, p)
-            feats = list((p.get("features", {}) or {}).keys())
-            ev = explain_match(row, p.get("id"), s, feats) if explain_match else "similarity %.3f" % s
-            res.append({"pattern_id": p.get("id"), "similarity": s, "matched": s >= 0.5, "evidence": ev, "explanation": ev})
+            m = s >= _MATCH_THRESHOLD
+            feats = _overlap_features(row, p)
+            ev = explain_match(row, p.get("id"), s, feats, m, _MATCH_THRESHOLD) if explain_match else "similarity %.3f" % s
+            res.append({"pattern_id": p.get("id"), "similarity": s, "matched": m, "evidence": ev, "explanation": ev})
         res.sort(key=lambda d: (-d["similarity"], str(d["pattern_id"])))
         return res
 
-    def detect(self, data):
+    def detect(self, data: Any) -> dict:
         """discover + match in one pass over the data."""
         disc = self.discover(data)
         matches = [m for r in _rows(data) for m in self.match(r)]
         expl = "detect: %d pattern(s), %d match(es) over %d observation(s)." % (disc.get("count", 0), len(matches), len(_rows(data)))
-        return {"patterns": disc.get("patterns", []), "matches": matches, "reason": expl, "explanation": expl, "evidence": disc.get("evidence", {})}
+        # WS5: detect reports discover's status (match adds no new claims).
+        return {"patterns": disc.get("patterns", []), "matches": matches, "reason": expl, "explanation": expl, "evidence": disc.get("evidence", {}),
+                "status": disc.get("status", STATUS_FOUND),
+                "status_reason": "detect: " + str(disc.get("status_reason", disc.get("status", STATUS_FOUND)))}
 
-    def find_anomalies(self, data):
+    def find_anomalies(self, data: Any) -> dict:
         """Flag statistical outliers + novel/missing sequence transitions."""
         rows = _rows(data)
         st = _stats([r["value"] for r in rows])
         zt = float(self.config.get("z_threshold", 3.0))
+        try:
+            _min_a = max(1, int(self.config.get("min_data_anomalies", 2)))
+        except (TypeError, ValueError):
+            _min_a = 2
+        if len(rows) < _min_a:
+            _r = ("INSUFFICIENT_DATA: need >= %d observation(s) for anomaly detection, got %d."
+                  % (_min_a, len(rows)))
+            return {"anomalies": [], "count": 0, "reason": _r, "explanation": _r,
+                    "evidence": {"stats": st}, "status": STATUS_INSUFFICIENT,
+                    "status_reason": _r}
+        try:
+            _vocab = {str(r.get("label", r.get("value", ""))) for r in rows}
+        except Exception:
+            _vocab = set()
+        try:
+            _all_pats = self.repo.all()
+        except Exception:
+            _all_pats = []
+        # D2: only patterns sharing label vocabulary with the input are
+        # relevant. Unrelated history (e.g. ABC patterns vs a numeric
+        # series) must not make a flat series look "novel".
+        relevant = []
+        for _p in _all_pats:
+            if not isinstance(_p, dict):
+                continue
+            try:
+                _pseq = {str(x) for x in (_p.get("sequence", []) or [])}
+            except Exception:
+                continue
+            if _pseq & _vocab:
+                relevant.append(_p)
         if _anomaly_detect is not None:
-            out = _anomaly_detect(rows, st, zt, self.repo.all())
+            out = _anomaly_detect(rows, st, zt, relevant)
         else:
             out = [{"index": r["index"], "value": r["value"], "kind": "statistical", "score": 0.9,
                     "causes": ["z-threshold"], "explanation": "outlier"} for r in rows
                    if isinstance(r["value"], (int, float)) and st["stdev"] > 0 and abs((r["value"] - st["mean"]) / st["stdev"]) >= zt]
-        if self.config.get("multivariate", True) and detect_multivariate is not None and _embed_windows is not None:
+        try:
+            _raws = [r.get("raw") for r in rows if isinstance(r.get("raw"), dict)]
+            _ncols = len(_numeric_columns(_raws)) if _raws else 0
+        except Exception:
+            _ncols = 0
+        # D3: the multivariate detector only runs on genuinely
+        # multivariate input (>= 2 numeric columns). A univariate series
+        # must not go through it.
+        if _ncols >= 2 and self.config.get("multivariate", True) and detect_multivariate is not None and _embed_windows is not None:
             try:
                 pairs = [(r["index"], r["value"]) for r in rows
                          if isinstance(r.get("value"), (int, float)) and not isinstance(r.get("value"), bool)]
@@ -761,7 +1208,7 @@ class Nexora:
                 if len(pairs) >= 2 * msize:
                     wvecs, wstarts = _embed_windows([v for _, v in pairs], msize)
                     if wvecs:
-                        mv = detect_multivariate(wvecs, threshold=float(self.config.get("mv_threshold", 0.9)))
+                        mv = detect_multivariate(wvecs, threshold=float(self.config.get("mv_threshold", 0.8)))
                         for a in mv.get("anomalies", []):
                             try:
                                 _ei = wstarts[a["index"]] + msize - 1
@@ -773,23 +1220,83 @@ class Nexora:
                                     continue
                             ri = pairs[_ei][0]
                             rv = pairs[_ei][1]
-                            dims = mv.get("dims", msize)
-                            out.append({
-                                "index": ri, "value": rv, "z": 0.0, "score": a["score"],
-                                "kind": "multivariate",
+                    dims = mv.get("dims", msize)
+                    try:
+                        _msev = _severity_of(a["score"]) if _severity_of else "high"
+                    except Exception:
+                        _msev = "high"
+                    out.append({
+                        "index": ri, "value": rv, "z": None, "score": a["score"],
+                        "kind": "multivariate",
                                 "causes": ["window d2=%.2f over %d dims" % (a["d2"], dims)],
                                 "explanation": ("Multivariate outlier at window ending index %s: "
                                                 "Mahalanobis d2=%.2f across %d dims, score %.2f "
                                                 "(threshold %s)." % (ri, a["d2"], dims, a["score"],
                                                                       self.config.get("mv_threshold", 0.8))),
+                                "severity": _msev,
                             })
             except Exception:
                 pass
-        out.sort(key=lambda d: (d.get("index", 0), d.get("kind", "")))
+        # WS4: robust rolling median/MAD scores (causal) + level shifts.
+        # Seasonal phase-centering comes from the strongest stored
+        # seasonal pattern, if any qualifies.
+        if _robust_detect is not None and self.config.get("robust", True):
+            try:
+                _per = None
+                try:
+                    _best = None
+                    for _sp in self.repo.all():
+                        if not isinstance(_sp, dict) or _sp.get("type") != "seasonal":
+                            continue
+                        _ff = _sp.get("features", {}) or {}
+                        _pp = int(_ff.get("period", 0) or 0)
+                        _ss = float(_ff.get("seasonal_strength", 0.0) or 0.0)
+                        if _pp >= 2 and _ss >= 0.5 and (_best is None or _ss > _best[0]):
+                            _best = (_ss, _pp)
+                    if _best is not None:
+                        _per = _best[1]
+                except Exception:
+                    _per = None
+                try:
+                    _rw = max(1, int(self.config.get("robust_window", 20)))
+                except (TypeError, ValueError):
+                    _rw = 20
+                try:
+                    _rt = float(self.config.get("robust_threshold", 3.5))
+                except (TypeError, ValueError):
+                    _rt = 3.5
+                try:
+                    out.extend(_robust_detect(rows, window=_rw, threshold=_rt, period=_per) or [])
+                except (ValueError, TypeError):
+                    pass
+            except Exception:
+                pass
+        if _level_shifts is not None and self.config.get("level_shifts", True):
+            try:
+                _lw = max(1, int(self.config.get("ls_window", 10)))
+            except (TypeError, ValueError):
+                _lw = 10
+            try:
+                _lt = float(self.config.get("ls_threshold", 3.0))
+            except (TypeError, ValueError):
+                _lt = 3.0
+            try:
+                out.extend(_level_shifts(rows, window=_lw, threshold_z=_lt) or [])
+            except (ValueError, TypeError):
+                pass
+        # D3: one event produces one record — merge same-index hits.
+        out = _merge_anomalies(out)
         expl = "Found %d anomalie(s) (z_threshold=%s)." % (len(out), zt)
-        return {"anomalies": out, "count": len(out), "reason": expl, "explanation": expl, "evidence": {"stats": st}}
+        if out:
+            _status, _sreason = STATUS_FOUND, ("FOUND: %d anomalie(s) in %d observation(s)."
+                                                % (len(out), len(rows)))
+        else:
+            _status, _sreason = STATUS_NONE, ("NONE: no anomalies in %d observation(s) "
+                                               "(z_threshold=%s)." % (len(rows), zt))
+        return {"anomalies": out, "count": len(out), "reason": expl, "explanation": expl,
+                "evidence": {"stats": st}, "status": _status, "status_reason": _sreason}
 
-    def predict(self, data, current=None):
+    def predict(self, data: Any, current: Any = None) -> dict:
         """P(next|current) from bigram counts + backoff context model.
 
         predictions: first-order Markov (stable v0.1 field). context:
@@ -817,6 +1324,26 @@ class Nexora:
             mlabels = [_l for _l in labels if _keep_lab(_l)]
         except Exception:
             mlabels = list(labels)
+        try:
+            _min_p = max(1, int(self.config.get("min_data_predict", 2)))
+        except (TypeError, ValueError):
+            _min_p = 2
+        # INSUFFICIENT only when nothing is computable at all: too few
+        # labels for transitions AND too few numerics for extrapolation.
+        try:
+            _nvals_early = sum(1 for _r in _rows(data)
+                               if isinstance(_r.get("value"), (int, float))
+                               and not isinstance(_r.get("value"), bool))
+        except Exception:
+            _nvals_early = 0
+        if len(mlabels) < _min_p and _nvals_early < 3:
+            _r = ("INSUFFICIENT_DATA: need >= %d usable label(s) for prediction, got %d "
+                  "(and only %d numeric value(s), need 3 for extrapolation)."
+                  % (_min_p, len(mlabels), _nvals_early))
+            return {"current": None, "predictions": [], "context": [], "log_loss": None,
+                    "extrapolation": {}, "reason": _r, "explanation": _r,
+                    "evidence": {"matrix_states": []}, "status": STATUS_INSUFFICIENT,
+                    "status_reason": _r}
         if build_transition_matrix is not None:
             self._matrix = build_transition_matrix(mlabels)
             cur = current if current is not None else (mlabels[-1] if mlabels else None)
@@ -890,21 +1417,74 @@ class Nexora:
                         extrap["seasonal"] = {"source": "seasonal", "next": [_phase], "period": _pp}
             except Exception:
                 pass
+        # WS5: explicit status from the top candidates (mirrors the
+        # predict_next abstain gates: thin evidence must not read FOUND).
+        _best_p, _best_tot = -1.0, 0
+        for _cand in (list(preds[:1]) + list(ctx_preds[:1])):
+            try:
+                if isinstance(_cand, dict):
+                    _p = float(_cand.get("probability", -1.0))
+                    _t = int(_cand.get("total", _cand.get("count", 0)))
+                    if _p > _best_p:
+                        _best_p, _best_tot = _p, _t
+            except (TypeError, ValueError):
+                pass
+        try:
+            _abst = float(self.config.get("abstain_threshold", 0.5))
+        except (TypeError, ValueError):
+            _abst = 0.5
+        try:
+            _min_ev = int(self.config.get("min_evidence", 2))
+        except (TypeError, ValueError):
+            _min_ev = 2
+        _has_extrap = isinstance(extrap, dict) and bool(
+            extrap.get("next") or extrap.get("trend")
+            or (extrap.get("seasonal") or {}).get("next")
+            or (extrap.get("kind") not in (None, "unknown") and extrap.get("next")))
+        if not preds and not ctx_preds and _has_extrap:
+            _status = STATUS_FOUND
+            _sreason = ("FOUND: closed-form extrapolation available "
+                        "(no Markov/context transitions from '%s')." % cur)
+        elif not preds and not ctx_preds:
+            _status = STATUS_NONE
+            _sreason = ("NONE: no recorded outgoing transitions from '%s'%s."
+                        % (cur, " (arithmetic extrapolation still available)" if _has_extrap else ""))
+        elif _best_p < _abst or _best_tot < _min_ev:
+            _status = STATUS_LOW_CONF
+            _sreason = ("LOW_CONFIDENCE: best P=%.3f (N=%d) below abstain_threshold=%.2f / "
+                        "min_evidence=%d after '%s'." % (_best_p, _best_tot, _abst, _min_ev, cur))
+        else:
+            _status = STATUS_FOUND
+            _sreason = ("FOUND: %d Markov + %d context candidate(s) after '%s' (best P=%.3f, N=%d)."
+                        % (len(preds), len(ctx_preds), cur, _best_p, _best_tot))
         return {"current": cur, "predictions": preds, "context": ctx_preds, "log_loss": log_loss,
                 "extrapolation": extrap,
-                "reason": expl, "explanation": expl, "evidence": {"matrix_states": states}}
+                "reason": expl, "explanation": expl, "evidence": {"matrix_states": states},
+                "status": _status, "status_reason": _sreason}
 
-    def predict_next(self, data, current=None):
+    def predict_next(self, data: Any, current: Any = None) -> dict:
         """Single best next symbol (v2 additive; does not alter predict()).
 
         Precedence: arithmetic when extrapolation kind != unknown and
         confidence >= 0.9; else context top when its probability >= markov
-        top (ties go to context); else markov top; else none.
+        top (ties go to context); else markov top; else none. WS6: the
+        chosen statistical candidate is held to abstain_threshold /
+        min_evidence — below either, the engine abstains rather than
+        guessing (source "abstain", next None).
         """
+        try:
+            _abstain_p = float(self.config.get("abstain_threshold", 0.5))
+        except (TypeError, ValueError):
+            _abstain_p = 0.5
+        try:
+            _min_ev = int(self.config.get("min_evidence", 2))
+        except (TypeError, ValueError):
+            _min_ev = 2
         try:
             _full = self.predict(data, current=current)
         except Exception:
-            return {"next": None, "probability": 0.0, "source": "none", "evidence": "no recorded transitions"}
+            return {"next": None, "probability": 0.0, "source": "none", "evidence": "no recorded transitions",
+                    "status": STATUS_NONE, "status_reason": "NONE: prediction failed; nothing recorded."}
         try:
             _ex = _full.get("extrapolation", {}) or {}
             if isinstance(_ex, dict) and _ex.get("kind") not in (None, "unknown") and _ex.get("next"):
@@ -917,7 +1497,9 @@ class Nexora:
                     if _nxts:
                         return {"next": _nxts[0], "probability": max(0.0, min(1.0, _conf)),
                                 "source": "arithmetic",
-                                "evidence": "extrapolation kind %s confidence %.3f." % (_ex.get("kind"), _conf)}
+                                "evidence": "extrapolation kind %s confidence %.3f." % (_ex.get("kind"), _conf),
+                                "status": STATUS_FOUND,
+                                "status_reason": "FOUND: arithmetic extrapolation."}
         except Exception:
             pass
         try:
@@ -934,30 +1516,55 @@ class Nexora:
             except (TypeError, ValueError):
                 _mp = -1.0
             if isinstance(_ct, dict) and _cp >= 0.0 and (not isinstance(_mt, dict) or _cp >= _mp):
-                return {"next": _ct.get("next"), "probability": max(0.0, min(1.0, _cp)),
-                        "source": "context", "evidence": str(_ct.get("evidence", ""))}
-            if isinstance(_mt, dict) and _mp >= 0.0:
-                return {"next": _mt.get("next"), "probability": max(0.0, min(1.0, _mp)),
-                        "source": "markov", "evidence": str(_mt.get("evidence", ""))}
+                _pick, _pick_p, _pick_s = _ct, _cp, "context"
+            elif isinstance(_mt, dict) and _mp >= 0.0:
+                _pick, _pick_p, _pick_s = _mt, _mp, "markov"
+            else:
+                _pick = None
+            if isinstance(_pick, dict):
+                try:
+                    _tot = _pick.get("total", _pick.get("count", _min_ev))
+                    _tot = int(_tot)
+                except (TypeError, ValueError):
+                    _tot = _min_ev
+                _pp = max(0.0, min(1.0, _pick_p))
+                if _pp < _abstain_p or _tot < _min_ev:
+                    return {"next": None, "probability": _pp, "source": "abstain",
+                            "evidence": ("Abstained: top %s candidate '%s' has P=%.3f (N=%d), "
+                                         "below abstain_threshold=%.2f / min_evidence=%d."
+                                         % (_pick_s, _pick.get("next"), _pp, _tot,
+                                            _abstain_p, _min_ev)),
+                            "status": STATUS_LOW_CONF,
+                            "status_reason": ("LOW_CONFIDENCE: abstained (P=%.3f, N=%d)."
+                                              % (_pp, _tot))}
+                return {"next": _pick.get("next"), "probability": _pp,
+                        "source": _pick_s, "evidence": str(_pick.get("evidence", "")),
+                        "status": STATUS_FOUND,
+                        "status_reason": "FOUND: %s prediction." % _pick_s}
         except Exception:
             pass
-        return {"next": None, "probability": 0.0, "source": "none", "evidence": "no recorded transitions"}
+        return {"next": None, "probability": 0.0, "source": "none", "evidence": "no recorded transitions",
+                "status": STATUS_NONE, "status_reason": "NONE: no recorded transitions."}
 
-    def get_pattern(self, pid):
+    def get_pattern(self, pid: str) -> dict | None:
         """Return one stored pattern dict (or None)."""
         return self.repo.get(pid)
 
-    def get_history(self, pid):
+    def get_history(self, pid: str) -> dict:
         """Occurrences + confidence trail for one pattern."""
         p = self.repo.get(pid)
         if p is None:
-            return {"pattern_id": pid, "occurrences": [], "confidence_trail": [], "reason": "Pattern not found."}
+            _r = "Pattern not found."
+            return {"pattern_id": pid, "occurrences": [], "confidence_trail": [], "reason": _r,
+                    "status": STATUS_NONE, "status_reason": "NONE: " + _r}
         occ = p.get("occurrences", []) if isinstance(p, dict) else _get(p, "occurrences", [])
         trail = list(self._trail.get(pid, [p.get("confidence", 0.5) if isinstance(p, dict) else 0.5]))
         return {"pattern_id": pid, "occurrences": occ, "confidence_trail": trail,
-                "reason": "History for %s: %d occurrence(s)." % (pid, len(occ))}
+                "reason": "History for %s: %d occurrence(s)." % (pid, len(occ)),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: history for %s." % pid}
 
-    def explain(self, result):
+    def explain(self, result: Any) -> str:
         """Human-readable summary of any result dict."""
         if summarize_result is not None:
             try:
@@ -966,7 +1573,7 @@ class Nexora:
                 pass
         return str(result)
 
-    def quality(self, data):
+    def quality(self, data: Any) -> dict:
         """Data-quality report: raw lists, or a file path (parsed, then raw values assessed).
 
         Never raises on ordinary data. Raises TypeError for non-list /
@@ -976,10 +1583,24 @@ class Nexora:
             raise ImportError("nexora.ingestion.quality is required")
         if isinstance(data, os.PathLike) or _is_file_path(data):
             rows = _rows(data)
-            return _quality_report([r.get("raw") for r in rows])
-        return _quality_report(data)
+            rep = _quality_report([r.get("raw") for r in rows])
+        else:
+            rep = _quality_report(data)
+        if not isinstance(rep, dict):
+            return rep
+        try:
+            _qn = int(rep.get("n", 0) or 0)
+        except (TypeError, ValueError):
+            _qn = 0
+        if _qn == 0:
+            rep["status"] = STATUS_INSUFFICIENT
+            rep["status_reason"] = "INSUFFICIENT_DATA: no observations to assess."
+        else:
+            rep["status"] = STATUS_FOUND
+            rep["status_reason"] = "FOUND: quality assessed over %d observation(s)." % _qn
+        return rep
 
-    def report(self, result, fmt="markdown"):
+    def report(self, result: Any, fmt: str = "markdown") -> str:
         """Full human-readable report: fmt="markdown" (default) or "text".
 
         Never raises on malformed results (coerces with placeholders).
@@ -992,7 +1613,7 @@ class Nexora:
             raise ImportError("nexora.explanation.report is required")
         return _render_markdown(result)
 
-    def save(self, path):
+    def save(self, path: Any) -> Any:
         """Persist engine state (config, patterns, trails) to path (atomic write).
 
         Returns path. Raises ImportError if store module missing, OSError
@@ -1002,7 +1623,7 @@ class Nexora:
             raise ImportError("nexora.memory.store is required")
         return _save_state(path, self.repo, trails=self._trail, config=self.config)
 
-    def load(self, path):
+    def load(self, path: Any) -> dict:
         """Load state saved by save(); replaces memory, trails, config.
 
         Returns {"patterns", "version", "reason"}. Raises
@@ -1024,9 +1645,11 @@ class Nexora:
             except Exception:
                 pass
         return {"patterns": self.repo.size(), "version": st.get("version"),
-                "reason": "Loaded %d pattern(s) (schema v%s)." % (self.repo.size(), st.get("version"))}
+                "reason": "Loaded %d pattern(s) (schema v%s)." % (self.repo.size(), st.get("version")),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: state loaded."}
 
-    def batch(self, datasets):
+    def batch(self, datasets: Any) -> list:
         """Isolated detect() per dataset (fresh engine each); returns outcomes.
 
         One bad dataset records {"error": ...} and never kills the batch.
@@ -1036,3 +1659,163 @@ class Nexora:
         if _batch_process is None:
             raise ImportError("nexora.api.batch is required")
         return _batch_process(datasets, self.config)
+
+    def update(self, data: Any, *, detect_changes: bool = True) -> dict:
+        """Fold new observations into bounded incremental state (WS7).
+
+        O(1) amortized per observation, O(window + vocab^2 + capacity)
+        memory: Welford running stats, a sliding window, bigram
+        transition counts, and a capacity-capped recent history. The
+        full history is NEVER reprocessed (update() never iterates
+        ``self._history``). Online change detection compares the full
+        trailing window mean against the long-run mean (|z| >=
+        change_z, one event per window cooldown) using past data only.
+
+        Returns {"processed", "total", "stats", "window", "changes"
+        (new events this call), "changes_total", "reason"}.
+        """
+        if _RunningStats is None or _SlidingStats is None:
+            raise ImportError("nexora.streaming is required")
+        import math as _math
+        try:
+            cap = max(1, int(self.config.get("stream_capacity", 1024)))
+        except (TypeError, ValueError):
+            cap = 1024
+        if self._history.maxlen != cap:
+            # Rebuild only when the capacity actually changed.
+            self._history = collections.deque(self._history, maxlen=cap)
+        if self._stream_stats is None:
+            self._stream_stats = _RunningStats()
+        try:
+            wsize = max(1, int(self.config.get("window", 20)))
+        except (TypeError, ValueError):
+            wsize = 20
+        if self._stream_window is None or self._stream_window.window != wsize:
+            self._stream_window = _SlidingStats(wsize)
+        try:
+            cz = float(self.config.get("change_z", 6.0))
+        except (TypeError, ValueError):
+            cz = 6.0
+        if not cz > 0:
+            cz = 6.0
+        rows = _rows(data)
+        new_changes = []
+        for r in rows:
+            v = r.get("value")
+            lab = r.get("label")
+            try:
+                lab_ok = lab is not None and lab == lab and hash(lab) is not None
+            except TypeError:
+                lab_ok = False
+            num_ok = (isinstance(v, (int, float)) and not isinstance(v, bool)
+                      and _math.isfinite(float(v)))
+            if num_ok and detect_changes:
+                try:
+                    x = float(v)
+                    if self._stream_window.n >= wsize and self._stream_stats.n >= 2 * wsize:
+                        wm = self._stream_window.mean
+                        lm = self._stream_stats.mean
+                        ls = self._stream_stats.stdev
+                        if wm is not None and lm is not None and ls is not None:
+                            if ls == 0.0:
+                                fire = wm != lm
+                                z = _math.inf if x > lm else (-_math.inf if x < lm else 0.0)
+                            else:
+                                se = ls / _math.sqrt(wsize)
+                                z = (wm - lm) / se if se > 0 else 0.0
+                                fire = abs(z) >= cz
+                            if fire and (self._stream_n - self._stream_last_change) >= wsize:
+                                score = 1.0 if z in (_math.inf, -_math.inf) else min(1.0, abs(z) / (cz * 2.0))
+                                ev = {"index": r.get("index"), "value": v, "z": z,
+                                      "score": score, "kind": "stream_change",
+                                      # index is per-call; stream_pos is global.
+                                      "stream_pos": self._stream_n,
+                                      "causes": ["window mean %.4g vs long-run mean %.4g "
+                                                 "(long stdev %.4g, |z|=%.2f >= %.2f)"
+                                                 % (wm, lm, ls, z, cz)],
+                                      "explanation": ("Online change at index %s (value %s): "
+                                                      "trailing-%d mean %.4g deviates |z|=%.2f "
+                                                      "from long-run mean %.4g (threshold %.2f)."
+                                                      % (r.get("index"), v, wsize, wm, z, lm, cz))}
+                                try:
+                                    ev["severity"] = _severity_of(score) if _severity_of else "high"
+                                except Exception:
+                                    ev["severity"] = "high"
+                                self._stream_changes.append(ev)
+                                if len(self._stream_changes) > _STREAM_CHANGES_CAP:
+                                    del self._stream_changes[:-_STREAM_CHANGES_CAP]
+                                self._stream_last_change = self._stream_n
+                                new_changes.append(ev)
+                except Exception:
+                    pass
+            try:
+                self._stream_stats.update(v)
+            except Exception:
+                pass
+            try:
+                self._stream_window.update(v)
+            except Exception:
+                pass
+            if lab_ok:
+                if self._stream_prev is not _STREAM_UNSET:
+                    try:
+                        self._stream_trans[(self._stream_prev, lab)] += 1
+                        self._stream_totals[self._stream_prev] += 1
+                    except TypeError:
+                        pass
+                self._stream_prev = lab
+            try:
+                r["stream_pos"] = self._stream_n
+            except Exception:
+                pass
+            self._history.append(r)
+            self._stream_n += 1
+        try:
+            _s = {"n": self._stream_stats.n, "mean": self._stream_stats.mean,
+                  "stdev": self._stream_stats.stdev, "missing": self._stream_stats.missing}
+        except Exception:
+            _s = {"n": 0, "mean": None, "stdev": None, "missing": 0}
+        try:
+            _w = {"window": self._stream_window.window, "n": self._stream_window.n,
+                  "mean": self._stream_window.mean, "stdev": self._stream_window.stdev}
+        except Exception:
+            _w = {"window": wsize, "n": 0, "mean": None, "stdev": None}
+        return {"processed": len(rows), "total": self._stream_n, "stats": _s,
+                "window": _w, "changes": new_changes,
+                "changes_total": len(self._stream_changes),
+                "reason": ("Streamed %d observation(s), %d total; %d new change(s), %d retained."
+                           % (len(rows), self._stream_n, len(new_changes),
+                              len(self._stream_changes))),
+                "status": STATUS_FOUND if rows else STATUS_NONE,
+                "status_reason": ("FOUND: streamed %d observation(s)." % len(rows)
+                                  if rows else "NONE: empty chunk; state unchanged.")}
+
+    def stream_predict(self, current: Any = None) -> dict:
+        """Next-symbol prediction from the incremental stream model (WS7).
+
+        Same MLE math as the batch Markov path, over transition counts
+        maintained by update() (no history scan). Returns {"current",
+        "predictions", "n", "reason"}; empty predictions when the
+        current label has no recorded outgoing transitions.
+        """
+        if build_transition_matrix is None or predict_next is None:
+            raise ImportError("nexora.prediction.markov is required")
+        cur = current if current is not None else self._stream_prev
+        if cur is _STREAM_UNSET:
+            cur = None
+        try:
+            matrix = {"states": sorted({a for a, _ in self._stream_trans} | {b for _, b in self._stream_trans},
+                                       key=str),
+                      "counts": dict(self._stream_trans), "probs": {}}
+        except Exception:
+            matrix = {"states": [], "counts": {}, "probs": {}}
+        try:
+            preds = predict_next(cur, matrix, top_k=3) if cur is not None else []
+        except Exception:
+            preds = []
+        return {"current": cur, "predictions": preds, "n": self._stream_n,
+                "reason": ("Stream model after %d observation(s): %d prediction(s) after '%s'."
+                           % (self._stream_n, len(preds), cur)),
+                "status": STATUS_FOUND if preds else STATUS_NONE,
+                "status_reason": ("FOUND: stream predictions after '%s'." % cur
+                                  if preds else "NONE: no stream transitions from '%s'." % cur)}

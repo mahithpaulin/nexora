@@ -29,17 +29,23 @@ def find_recurring_values(labels, min_support=2) -> list[dict]:
     if min_support < 1:
         raise ValueError("min_support must be >= 1")
     labels = list(labels)
-    valid = [(i, v) for i, v in enumerate(labels)
-             if v is not None and not (isinstance(v, float) and math.isnan(v))]
-    total = len(valid)
+    # WS8: single pass for counts + positions (was a rescan per value).
+    counts: Counter = Counter()
+    positions: dict = {}
+    total = 0
+    for i, v in enumerate(labels):
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            continue
+        total += 1
+        counts[v] += 1
+        positions.setdefault(v, []).append(i)
     if total == 0:
         return []
-    counts = Counter(v for _, v in valid)
     out: list[dict] = []
     for value, cnt in sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0]))):
         if cnt < min_support:
             continue
-        occ = [i for i, v in valid if v == value]
+        occ = positions[value]
         support = cnt / total
         out.append(_pattern("recurring_value",
                             {"value": value, "count": cnt, "support": support},
