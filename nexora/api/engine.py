@@ -31,9 +31,17 @@ try:
     from nexora.discovery.change_points import change_points
     from nexora.discovery.prune import closed_keep as _closed_keep
     from nexora.discovery.prune import is_contiguous_subsequence as _is_subseq
+    from nexora.discovery.significance import annotate as _sig_annotate
+    from nexora.discovery.significance import is_significant as _sig_decide
+    try:
+        from nexora.discovery.significance import annotation_stats as _sig_batch
+    except ImportError:
+        _sig_batch = None
 except ImportError:
     find_recurring_values = find_frequent_sequences = change_points = None
     _closed_keep = _is_subseq = None
+    _sig_annotate = _sig_decide = None
+    _sig_batch = None
 try:
     from nexora.matching.similarity import sequence_similarity, pearson_similarity, cosine_similarity
     from nexora.matching.distance import euclidean, normalized_similarity
@@ -130,6 +138,8 @@ DEFAULT_CONFIG = {"z_threshold": 3.0, "min_support": 3, "max_n": 3, "window": 20
                   "robust": True, "robust_window": 20, "robust_threshold": 3.5,
                   "level_shifts": True, "ls_window": 10, "ls_threshold": 3.0,
                   "abstain_threshold": 0.5, "min_evidence": 2,
+                  "significance": True, "sig_p_threshold": 0.05, "sig_min_lift": 1.5,
+                  "sig_shuffles": 199, "sig_seed": 42, "sig_min_n": 30,
                   "evolve_drift": 0.4, "max_period": 256}
 
 
@@ -590,9 +600,12 @@ class Nexora:
             except Exception:
                 found = []
         if not found:
-            cnt = collections.Counter(str(v) for v in values)
+            cnt = collections.Counter(str(v) for v in values
+                                      if v is not None and v == v)
             idxs = {}
             for r in rows:
+                if r["value"] is None or r["value"] != r["value"]:
+                    continue
                 idxs.setdefault(str(r["value"]), []).append(r["index"])
             for val, c in cnt.items():
                 if c >= min_sup:
@@ -625,14 +638,20 @@ class Nexora:
                 seqs = []
         if not seqs and len(labels) > 1:
             for (a, b), c in collections.Counter(zip(labels, labels[1:])).items():
-                if c >= min_sup:
+                # Missing labels never form patterns (None/NaN skipped).
+                if c >= min_sup and a is not None and b is not None and a == a and b == b:
                     seqs.append({"sequence": [a, b], "support": c})
         for s in seqs:
             sq = list(s.get("sequence", [])) if isinstance(s, dict) else list(s)
+            # Missing labels never form patterns (fixes a [None, None]
+            # artifact with a misread support that predates v2).
+            if sq and all(_x is None or _x != _x for _x in sq):
+                continue
             if isinstance(s, dict):
                 feats = s.get("features", {}) or {}
                 try:
-                    sup = int(feats.get("count", s.get("frequency", min_sup)) or min_sup)
+                    sup = int(feats.get("count", s.get("frequency", s.get("support", min_sup)))
+                              or min_sup)
                 except (TypeError, ValueError):
                     sup = min_sup
                 occ = list(s.get("occurrences", []) or [])
@@ -671,6 +690,110 @@ class Nexora:
             _kept_seqs = [(_k, _c) for _k, _c, _ in _kept]
             _pruned_ev = {"kept": len(_kept), "dropped": len(_dropped),
                           "details": _details[:20]}
+        # WS3: significance — annotate every candidate with its null
+        # baseline (expected support, lift, permutation p-value) and drop
+        # sequential patterns that could easily occur by chance. The
+        # per-pattern threshold is Bonferroni-corrected over the
+        # candidate set, and shuffles scale up until the p-value
+        # resolution reaches it. Filtering needs powered data
+        # (n >= sig_min_n); below that we annotate but drop nothing.
+        # show_all=True stores everything unvetted. Singletons are never
+        # dropped (their shuffle null is degenerate by construction).
+        try:
+            _sig_thr = float(self.config.get("sig_p_threshold", 0.05))
+        except (TypeError, ValueError):
+            _sig_thr = 0.05
+        try:
+            _sig_lift = float(self.config.get("sig_min_lift", 1.5))
+        except (TypeError, ValueError):
+            _sig_lift = 1.5
+        try:
+            _sig_nsh = max(1, int(self.config.get("sig_shuffles", 199)))
+        except (TypeError, ValueError):
+            _sig_nsh = 199
+        try:
+            _sig_seed = int(self.config.get("sig_seed", 42))
+        except (TypeError, ValueError):
+            _sig_seed = 42
+        try:
+            _sig_min_n = max(1, int(self.config.get("sig_min_n", 30)))
+        except (TypeError, ValueError):
+            _sig_min_n = 30
+        _sig_ev = {"annotated": 0, "dropped": 0, "details": [], "skipped": None,
+                   "thresholds": {"p": _sig_thr, "lift": _sig_lift,
+                                  "shuffles": _sig_nsh, "seed": _sig_seed,
+                                  "min_n": _sig_min_n, "alpha_effective": None}}
+        if _to_store and not show_all and self.config.get("significance", True) \
+                and _sig_annotate is not None and _sig_decide is not None:
+            try:
+                _multi = sum(1 for _d in _to_store if len(_d.get("sequence", []) or []) >= 2)
+                _alpha = _sig_thr / max(1, _multi)
+                _sig_ev["thresholds"]["alpha_effective"] = _alpha
+                _nsh = _sig_nsh
+                while 1.0 / (1.0 + _nsh) > _alpha and _nsh < 999:
+                    _nsh = min(999, _nsh * 2 + 1)
+                _sig_ev["thresholds"]["shuffles"] = _nsh
+                _ann_fn = _sig_batch if _sig_batch is not None else _sig_annotate
+                _ann = _ann_fn([dict(_d) for _d in _to_store], labels,
+                               n_shuffles=_nsh, seed=_sig_seed, max_patterns=500)
+                _by_seq = {}
+                for _a in _ann or []:
+                    try:
+                        _by_seq.setdefault(tuple(str(_x) for _x in (_a.get("sequence", []) or [])), _a)
+                    except Exception:
+                        continue
+                _sigged = []
+                for _d in _to_store:
+                    try:
+                        _key = tuple(str(_x) for _x in (_d.get("sequence", []) or []))
+                        _a = _by_seq.get(_key, {})
+                        # Method metadata lives OUTSIDE features so drift
+                        # snapshots (and dedupe signatures) compare only
+                        # the phenomenon, not our statistics about it.
+                        _nd = dict(_d)
+                        _nd["significance"] = {
+                            "expected_support": float(_a.get("expected_support", 0.0)),
+                            "lift": float(_a.get("lift", 1.0)),
+                            "p_value": float(_a.get("p_value", 1.0)),
+                        }
+                        _sigged.append(_nd)
+                    except Exception:
+                        _sigged.append(_d)
+                _sig_ev["annotated"] = len(_sigged)
+                if len(labels) < _sig_min_n:
+                    _sig_ev["skipped"] = ("n=%d below sig_min_n=%d: annotated only, nothing dropped."
+                                          % (len(labels), _sig_min_n))
+                    _to_store = _sigged
+                elif len(_to_store) > 500:
+                    _sig_ev["skipped"] = ("too many candidates (%d > 500): annotated only."
+                                          % len(_to_store))
+                    _to_store = _sigged
+                else:
+                    _kept2 = []
+                    for _d in _sigged:
+                        _sq = list(_d.get("sequence", []) or [])
+                        if len(_sq) >= 2:
+                            try:
+                                _sg = _d.get("significance", {}) or {}
+                                _ok, _why = _sig_decide(_sg.get("p_value", 1.0),
+                                                        _sg.get("lift", 1.0),
+                                                        _d.get("frequency", 0),
+                                                        min_support=min_sup,
+                                                        p_threshold=_alpha,
+                                                        min_lift=_sig_lift)
+                            except Exception:
+                                _ok, _why = True, "significance check errored; kept."
+                            if not _ok:
+                                _sig_ev["dropped"] += 1
+                                if len(_sig_ev["details"]) < 20:
+                                    _sig_ev["details"].append("%s dropped: %s" % (_sq, _why))
+                                continue
+                        _kept2.append(_d)
+                    _to_store = _kept2
+            except Exception as _se:
+                _sig_ev["skipped"] = "significance errored (%s); stored unvetted." % type(_se).__name__
+        elif _to_store and show_all:
+            _sig_ev["skipped"] = "show_all=True: stored unvetted."
         for _d in _to_store:
             self._store(_d)
         nums = [v for v in values
@@ -909,10 +1032,11 @@ class Nexora:
             skipped = {"multivariate": "n/a in discover (see find_anomalies)."}
         try:
             ev = {"stats": st, "structural": dict(_structural_ev),
-                  "skipped": dict(skipped), "pruned": dict(_pruned_ev)}
+                  "skipped": dict(skipped), "pruned": dict(_pruned_ev),
+                  "significance": dict(_sig_ev)}
         except Exception:
             ev = {"stats": st, "skipped": {"multivariate": "n/a in discover (see find_anomalies)."},
-                  "pruned": dict(_pruned_ev)}
+                  "pruned": dict(_pruned_ev), "significance": dict(_sig_ev)}
         return {"patterns": pats, "count": len(pats), "reason": expl, "explanation": expl,
                 "evidence": ev, "new_patterns": new_pats}
 
