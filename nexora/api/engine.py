@@ -3597,3 +3597,148 @@ class Nexora:
                 "reason": "Detrended %d value(s) (window %d)." % (len(vals), window),
                 "status": STATUS_FOUND,
                 "status_reason": "FOUND: detrended."}
+
+    # ---- v3 loop 2, batch M: discovery depth. ----
+
+    def motifs(self, data: Any, size: int = 3, top_k: int = 5) -> dict:
+        """Most frequent exact label windows (I66)."""
+        try:
+            size = max(2, int(size))
+            top_k = max(1, int(top_k))
+        except (TypeError, ValueError):
+            size, top_k = 3, 5
+        labels = [r.get("label") for r in _rows(data)
+                  if r.get("label") is not None and r.get("label") == r.get("label")]
+        if len(labels) < size:
+            _r = "INSUFFICIENT_DATA: need >= %d labels, got %d." % (size, len(labels))
+            return {"motifs": [], "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        cnt = collections.Counter(tuple(labels[i:i + size]) for i in range(len(labels) - size + 1))
+        total = sum(cnt.values())
+        table = [{"motif": list(k), "count": c, "support": c / total}
+                 for k, c in cnt.most_common(top_k)]
+        return {"motifs": table, "distinct": len(cnt), "size": size,
+                "reason": "Top motif %s x%d." % (table[0]["motif"], table[0]["count"]),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: motifs ready."}
+
+    def rules(self, data: Any, min_confidence: float = 0.5) -> dict:
+        """If-antecedent-then-consequent association rules (I67)."""
+        if _assoc_rules is None:
+            raise ImportError("nexora.features.structural is required")
+        try:
+            min_confidence = float(min_confidence)
+            if not 0 < min_confidence <= 1.0:
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise ValueError("min_confidence must be in (0, 1]")
+        labels = [r.get("label") for r in _rows(data)]
+        txns = [list(labels[i:i + 3]) for i in range(0, len(labels) - 2, 3)]
+        txns = [t for t in txns if len(t) == 3]
+        try:
+            min_sup = int(self.config.get("min_support", 3))
+        except (TypeError, ValueError):
+            min_sup = 3
+        try:
+            found = _assoc_rules(txns, min_support=min_sup,
+                                 min_confidence=min_confidence) or []
+        except Exception:
+            found = []
+        out = []
+        for rl in found:
+            try:
+                out.append({"if": rl.get("antecedent"), "then": rl.get("consequent"),
+                            "support": float(rl.get("support", 0.0) or 0.0),
+                            "confidence": float(rl.get("confidence", 0.0) or 0.0)})
+            except Exception:
+                continue
+        out.sort(key=lambda d: (-d["confidence"], str(d["if"])))
+        if out:
+            return {"rules": out, "count": len(out),
+                    "reason": "%d rule(s) at conf>=%.2f." % (len(out), min_confidence),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: rules ready."}
+        _r = "NONE: no rules at conf>=%.2f." % min_confidence
+        return {"rules": [], "count": 0, "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
+
+    def centrality(self, data: Any, top_k: int = 5) -> dict:
+        """Top labels by co-occurrence degree (I68)."""
+        if _co_graph is None:
+            raise ImportError("nexora.features.structural is required")
+        try:
+            top_k = max(1, int(top_k))
+        except (TypeError, ValueError):
+            top_k = 5
+        labels = [r.get("label") for r in _rows(data)]
+        try:
+            g = _co_graph(labels, window=2) or {}
+        except Exception:
+            g = {}
+        deg = collections.Counter()
+        try:
+            for pair, w in (g.get("edges", {}) or {}).items():
+                nodes = list(pair) if isinstance(pair, (list, tuple)) else [str(pair)]
+                for nd in nodes:
+                    try:
+                        deg[str(nd)] += float(w)
+                    except (TypeError, ValueError):
+                        continue
+        except Exception:
+            pass
+        table = [{"label": k, "degree": v} for k, v in deg.most_common(top_k)]
+        if table:
+            return {"nodes": table, "count": len(table),
+                    "reason": "Top hub '%s' (degree %.3g)." % (table[0]["label"], table[0]["degree"]),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: centrality ready."}
+        _r = "NONE: no co-occurrence edges."
+        return {"nodes": [], "count": 0, "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
+
+    def entropy(self, data: Any) -> dict:
+        """Shannon entropy of the value distribution, bits (I69)."""
+        import math as _m
+        f = self.frequencies(data)
+        if f["status"] != STATUS_FOUND:
+            _r = "NONE: nothing to measure."
+            return {"bits": 0.0, "max_bits": 0.0, "normalized": 0.0,
+                    "reason": _r, "explanation": _r,
+                    "status": STATUS_NONE, "status_reason": _r}
+        n = f["n"]
+        bits = -sum((x["count"] / n) * _m.log2(x["count"] / n)
+                    for x in f["frequencies"]) if n else 0.0
+        import math as _m2
+        max_bits = _m2.log2(f["distinct"]) if f["distinct"] > 1 else 0.0
+        norm = (bits / max_bits) if max_bits > 0 else 0.0
+        _r = "Entropy %.3f bits of %.3f max (%.0f%%)." % (bits, max_bits, 100.0 * norm)
+        return {"bits": bits, "max_bits": max_bits, "normalized": norm,
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    def stationarity(self, data: Any) -> dict:
+        """Half-split mean-shift verdict for numeric data (I70)."""
+        import statistics as _st
+        vals = self._numeric_values(_rows(data))
+        if len(vals) < 6:
+            _r = "INSUFFICIENT_DATA: need >= 6 numerics, got %d." % len(vals)
+            return {"verdict": "unknown", "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        half = len(vals) // 2
+        a, b = vals[:half], vals[half:2 * half]
+        ma, mb = _st.fmean(a), _st.fmean(b)
+        sa = _st.pstdev(a) if len(a) > 1 else 0.0
+        sb = _st.pstdev(b) if len(b) > 1 else 0.0
+        pooled = ((sa + sb) / 2.0) or 0.0
+        shift = abs(mb - ma)
+        if pooled == 0.0:
+            verdict = "drift" if shift > 0 else "stationary"
+            z = float("inf") if shift > 0 else 0.0
+        else:
+            z = shift / pooled
+            verdict = "drift" if z >= 2.0 else "stationary"
+        _r = "%s: halves %.4g vs %.4g (|z|=%.2f)." % (verdict, ma, mb, z)
+        return {"verdict": verdict, "mean_first": ma, "mean_second": mb,
+                "z": (None if z == float("inf") else z),
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
