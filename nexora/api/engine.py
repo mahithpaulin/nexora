@@ -1898,6 +1898,77 @@ class Nexora:
 
     # ---- v3 read-out helpers (I5-I9): additive, no behavior change. ----
 
+    def configure(self, config: dict | None = None, **kw) -> dict:
+        """Live-update config with fail-fast validation (I11).
+
+        Accepts a dict, kwargs, or both (kwargs win). Unknown keys are
+        NOT applied and are named in the result (validate_config
+        silently ignores them, which hid typos). Returns {"applied",
+        "unknown", "config", "status", ...}.
+        """
+        if _validate_config is None:
+            raise ImportError("nexora.core.config is required")
+        merged = dict(config or {})
+        merged.update(kw)
+        if not merged:
+            return {"applied": [], "unknown": [], "config": dict(self.config),
+                    "reason": "Config unchanged (nothing given).",
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: config unchanged."}
+        unknown = sorted(k for k in merged if k not in DEFAULT_CONFIG)
+        try:
+            new_cfg = _validate_config(merged)
+        except Exception:
+            # Validate against current+overlay so partial updates work:
+            # unknown keys are dropped before validating.
+            known = {k: v for k, v in merged.items() if k in DEFAULT_CONFIG}
+            new_cfg = _validate_config(known)
+        self.config = new_cfg
+        try:
+            cap = max(1, int(new_cfg.get("stream_capacity", 1024)))
+            if self._history.maxlen != cap:
+                self._history = collections.deque(self._history, maxlen=cap)
+        except Exception:
+            pass
+        if not unknown:
+            return {"applied": sorted(k for k in merged if k in DEFAULT_CONFIG),
+                    "unknown": [], "config": dict(self.config),
+                    "reason": "Config updated.",
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: config updated."}
+        _r = ("Config updated; unknown key(s) ignored: %s."
+              % ", ".join(unknown))
+        return {"applied": sorted(k for k in merged if k in DEFAULT_CONFIG),
+                "unknown": unknown, "config": dict(self.config),
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    def reset(self) -> dict:
+        """Clear memory, trails and stream state (I11). Config is kept."""
+        if PatternRepository is None:
+            raise ImportError("nexora.memory.repository is required")
+        self.repo = PatternRepository()
+        self._trail = {}
+        self._snaps = {}
+        self._matrix = None
+        self._ctx = None
+        self._stream_stats = None
+        self._stream_window = None
+        self._stream_trans = collections.Counter()
+        self._stream_totals = collections.Counter()
+        self._stream_prev = _STREAM_UNSET
+        self._stream_n = 0
+        self._stream_changes = []
+        self._stream_last_change = -10**12
+        try:
+            cap = max(1, int(self.config.get("stream_capacity", 1024)))
+        except (TypeError, ValueError):
+            cap = 1024
+        self._history = collections.deque(maxlen=cap)
+        _r = "Engine reset: memory, trails and stream state cleared."
+        return {"reason": _r, "explanation": _r, "status": STATUS_FOUND,
+                "status_reason": "FOUND: engine reset."}
+
     def describe(self, data: Any) -> dict:
         """Stats + quality snapshot for any iterable (I5).
 
