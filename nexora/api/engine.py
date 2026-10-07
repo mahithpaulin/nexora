@@ -1944,8 +1944,7 @@ class Nexora:
                 "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
 
     def reset(self) -> dict:
-        """Clear memory, trails and stream state (I11). Config is kept."""
-        if PatternRepository is None:
+        """Clear memory, trails and stream state (I11). Config is kept."""        if PatternRepository is None:
             raise ImportError("nexora.memory.repository is required")
         self.repo = PatternRepository()
         self._trail = {}
@@ -1968,6 +1967,66 @@ class Nexora:
         _r = "Engine reset: memory, trails and stream state cleared."
         return {"reason": _r, "explanation": _r, "status": STATUS_FOUND,
                 "status_reason": "FOUND: engine reset."}
+
+    def export_patterns(self) -> dict:
+        """JSON-serializable deep copies of stored patterns (I12)."""
+        import copy as _copy
+        try:
+            pats = [ _copy.deepcopy(p) for p in self.repo.all()
+                     if isinstance(p, dict)]
+        except Exception:
+            pats = []
+        try:
+            import json as _json
+            _json.dumps(pats)
+        except Exception:
+            pats = [p for p in pats if isinstance(p, dict)]
+        if pats:
+            return {"patterns": pats, "count": len(pats),
+                    "reason": "Exported %d pattern(s)." % len(pats),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: %d pattern(s) exported." % len(pats)}
+        _r = "NONE: no patterns stored to export."
+        return {"patterns": [], "count": 0, "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
+
+    def import_patterns(self, patterns: Any) -> dict:
+        """Import pattern dicts (e.g. from export_patterns) (I12).
+
+        Returns {"imported", "skipped", ...}. Malformed entries are
+        skipped and counted, never fatal.
+        """
+        if patterns is None:
+            patterns = []
+        elif isinstance(patterns, dict):
+            patterns = [patterns]
+        else:
+            try:
+                patterns = list(patterns)
+            except TypeError:
+                _r = "INSUFFICIENT_DATA: nothing importable given."
+                return {"imported": 0, "skipped": 0, "reason": _r,
+                        "explanation": _r, "status": STATUS_INSUFFICIENT,
+                        "status_reason": _r}
+        ok, skip = 0, 0
+        for p in patterns:
+            if not isinstance(p, dict):
+                skip += 1
+                continue
+            try:
+                self.repo.import_patterns([dict(p)])
+                ok += 1
+            except Exception:
+                skip += 1
+        if ok:
+            return {"imported": ok, "skipped": skip,
+                    "reason": "Imported %d pattern(s) (%d skipped)." % (ok, skip),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: imported %d pattern(s)." % ok}
+        _r = "NONE: imported 0 pattern(s) (%d skipped)." % skip
+        return {"imported": 0, "skipped": skip, "reason": _r,
+                "explanation": _r, "status": STATUS_NONE,
+                "status_reason": _r}
 
     def describe(self, data: Any) -> dict:
         """Stats + quality snapshot for any iterable (I5).

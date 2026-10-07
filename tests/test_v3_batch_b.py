@@ -30,3 +30,18 @@ def test_configure_and_reset():
     assert nx.reset()["status"] == "FOUND"
     assert nx.top_patterns()["status"] == "NONE"
     assert nx.stream_stats()["status"] == "NONE"
+
+
+def test_export_import_roundtrip():
+    import json
+    a = Nexora()
+    assert a.export_patterns()["status"] == "NONE"
+    a.discover(list("ABCABCABC"))
+    exp = a.export_patterns()
+    assert exp["status"] == "FOUND"
+    json.dumps(exp["patterns"])  # serializable
+    b = Nexora()
+    imp = b.import_patterns(exp["patterns"])
+    assert imp["status"] == "FOUND" and imp["imported"] == exp["count"]
+    assert b.top_patterns()["count"] == a.top_patterns()["count"]
+    assert b.import_patterns([None, 42])["status"] == "NONE"
