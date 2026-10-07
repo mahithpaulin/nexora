@@ -650,19 +650,30 @@ class Nexora:
         self._trail.setdefault(pid, []).append(c)
         return pid
 
-    def discover(self, data: Any, *, show_all: bool = False) -> dict:
+    def discover(self, data: Any, *, show_all: bool = False,
+                 min_support: int | None = None) -> dict:
         """Find recurring values + frequent sequences; store them; return evidence.
 
         Closed-pattern pruning (WS2) drops a recurring/sequential
         candidate when a longer kept sequence contains it with the same
         support-count. Pass show_all=True (or set config
         prune_redundant=False) to store every candidate.
+        min_support (I37): per-call support floor (validated int >= 1);
+        None (default) uses the config value.
         """
         rows = _rows(data)
         values = [r["value"] for r in rows]
         labels = [r["label"] for r in rows]
         st = _stats(values)
-        min_sup = int(self.config.get("min_support", 3))
+        if min_support is None:
+            min_sup = int(self.config.get("min_support", 3))
+        else:
+            try:
+                min_sup = int(min_support)
+            except (TypeError, ValueError):
+                raise ValueError("min_support must be an int >= 1")
+            if min_sup < 1:
+                raise ValueError("min_support must be an int >= 1")
         try:
             _min_d = max(1, int(self.config.get("min_data_discover", 1)))
         except (TypeError, ValueError):
@@ -1236,16 +1247,26 @@ class Nexora:
             out["anomaly_status"] = an.get("status", STATUS_NONE)
         return out
 
-    def find_anomalies(self, data: Any, min_severity: str | None = None) -> dict:
+    def find_anomalies(self, data: Any, min_severity: str | None = None,
+                       z_threshold: float | None = None) -> dict:
         """Flag statistical outliers + novel/missing sequence transitions.
 
         min_severity (I13): keep only records at/above this level
         ("low" < "medium" < "high" < "critical"); None keeps all.
         Unknown levels raise ValueError naming the four.
+        z_threshold (I38): per-call z floor; None uses the config value.
         """
         rows = _rows(data)
         st = _stats([r["value"] for r in rows])
-        zt = float(self.config.get("z_threshold", 3.0))
+        if z_threshold is None:
+            zt = float(self.config.get("z_threshold", 3.0))
+        else:
+            try:
+                zt = float(z_threshold)
+            except (TypeError, ValueError):
+                raise ValueError("z_threshold must be a number > 0")
+            if not zt > 0:
+                raise ValueError("z_threshold must be a number > 0")
         try:
             _min_a = max(1, int(self.config.get("min_data_anomalies", 2)))
         except (TypeError, ValueError):
@@ -1396,13 +1417,14 @@ class Nexora:
         return {"anomalies": out, "count": len(out), "reason": expl, "explanation": expl,
                 "evidence": {"stats": st}, "status": _status, "status_reason": _sreason}
 
-    def predict(self, data: Any, current: Any = None) -> dict:
+    def predict(self, data: Any, current: Any = None, top_k: int = 3) -> dict:
         """P(next|current) from bigram counts + backoff context model.
 
         predictions: first-order Markov (stable v0.1 field). context:
         variable-order backoff predictions with the order actually used.
         log_loss: mean base-2 NLL of the data under the context model
         (lower = more predictable; None when not computable).
+        top_k (I39): candidates per field; None uses 3.
         """
         labels = [r["label"] for r in _rows(data)]
         try:
@@ -1444,10 +1466,16 @@ class Nexora:
                     "extrapolation": {}, "reason": _r, "explanation": _r,
                     "evidence": {"matrix_states": []}, "status": STATUS_INSUFFICIENT,
                     "status_reason": _r}
+        try:
+            _tk = 3 if top_k is None else int(top_k)
+        except (TypeError, ValueError):
+            raise ValueError("top_k must be an int >= 1")
+        if _tk is True or _tk < 1:  # bool is not a valid top_k
+            raise ValueError("top_k must be an int >= 1")
         if build_transition_matrix is not None:
             self._matrix = build_transition_matrix(mlabels)
             cur = current if current is not None else (mlabels[-1] if mlabels else None)
-            preds = predict_next(cur, self._matrix, top_k=3) if cur is not None else []
+            preds = predict_next(cur, self._matrix, top_k=_tk) if cur is not None else []
         else:
             cur, preds = current, []
         ctx_preds, log_loss = [], None
@@ -1476,7 +1504,7 @@ class Nexora:
                         tail = (list(tail) + [current])[-mo:]
                         _ctx_from = "explicit current"
                 _ctx_query = list(tail)
-                ctx_preds = predict_with_context(self._ctx, tail, top_k=3) or []
+                ctx_preds = predict_with_context(self._ctx, tail, top_k=_tk) or []
                 if sequence_log_loss is not None:
                     try:
                         log_loss = sequence_log_loss(self._ctx, clean)
@@ -2763,3 +2791,74 @@ class Nexora:
                 "strength": float(tr.get("strength", tr.get("r2", 0.0)) or 0.0),
                 "reason": _r, "explanation": _r,
                 "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    # ---- v3 narratives + identity (batch G tail). ----
+
+    def explain_pattern(self, pid: str) -> dict:
+        """Plain-language narrative for one stored pattern (I35).
+
+        Combines type, support, confidence trail, lifecycle state,
+        significance and relationships into one paragraph — the
+        "what is this pattern and why should I trust it" answer.
+        """
+        p = self.get_pattern(pid)
+        if not isinstance(p, dict):
+            _r = "NONE: no pattern '%s' stored." % (pid,)
+            return {"narrative": _r, "reason": _r, "explanation": _r,
+                    "status": STATUS_NONE, "status_reason": _r}
+        bits = []
+        try:
+            bits.append("Pattern %s is a %s" % (p.get("id"), p.get("type", "pattern")))
+            freq = p.get("frequency", p.get("count", 1))
+            bits.append("seen %s time(s)" % (freq,))
+            occ = p.get("occurrences", []) or []
+            if occ:
+                bits.append("first at %s, last at %s" % (occ[0], occ[-1]))
+            conf = p.get("confidence", None)
+            if isinstance(conf, (int, float)):
+                bits.append("confidence %.2f" % conf)
+            state = p.get("state")
+            if state:
+                bits.append("lifecycle state %s" % (state,))
+            sig = p.get("significance", {}) or {}
+            if isinstance(sig, dict) and sig.get("p_value") is not None:
+                bits.append("permutation p=%.4g, lift=%.2f" % (
+                    sig.get("p_value", 1.0), sig.get("lift", 1.0)))
+            seq = p.get("sequence", []) or []
+            if seq:
+                bits.append("sequence %s" % (list(seq)[:8],))
+            trail = self._trail.get(str(p.get("id")), []) if isinstance(self._trail, dict) else []
+            if len(trail) > 1:
+                bits.append("confidence moved %.2f -> %.2f over %d sightings"
+                            % (trail[0], trail[-1], len(trail)))
+        except Exception:
+            pass
+        narrative = ("; ".join(bits) + ".") if bits else "Pattern %s." % (pid,)
+        return {"narrative": narrative, "pattern": p,
+                "reason": narrative, "explanation": narrative,
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: narrative for %s." % (pid,)}
+
+    def state_signature(self) -> dict:
+        """Short content hash of config + stored patterns (I36).
+
+        Changes iff the engine's knowledge changes — useful for
+        caching, tests and "did anything new arrive" checks.
+        Deterministic for identical states.
+        """
+        import hashlib as _hl
+        import json as _js
+        try:
+            all_p = sorted((self.repo.all() or []), key=lambda p: str(p.get("id", "")))
+        except Exception:
+            all_p = []
+        try:
+            payload = _js.dumps({"config": self.config, "patterns": all_p},
+                                sort_keys=True, default=str)
+        except Exception:
+            payload = str(len(all_p))
+        sig = _hl.sha256(payload.encode("utf-8")).hexdigest()[:16]
+        return {"signature": sig, "patterns": len(all_p),
+                "reason": "State signature %s over %d pattern(s)." % (sig, len(all_p)),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: signature computed."}
