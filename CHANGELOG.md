@@ -1,25 +1,32 @@
 # Changelog
 
-## v3 (in progress — branch `v3`, PR #3, unreleased)
+## 3.0.0
 
-Clarity + quirk-fix loop on top of 2.0.0. Public API unchanged: every
-change is additive or strictly widens accepted input, so v2 code runs
-as-is. Each item ships with regression tests (`tests/test_v3_*.py`)
-and an updated `docs/LIMITATIONS.md` note.
+50-iteration clarity + capability loop on top of 2.0.0 (branch `v3`,
+PR #3). Public API unchanged: everything is additive or strictly
+widens accepted input, so v2 code runs as-is. Each item ships with
+regression tests (`tests/test_v3_*.py`) and a `docs/LIMITATIONS.md`
+note where a quirk was fixed.
 
-- I1 ingestion: every entry point (`discover/detect/match/
-  find_anomalies/predict/update/quality/batch`, plus `parse` and
-  `quality_report`) iterates any iterable element-wise — list, tuple,
-  range, generator, .... A bare scalar/row-dict stays one observation,
-  and the `TypeError` names the fix (`wrap a single value as [value]`).
-- I2 prediction: `predict(data, current=X)` conditions BOTH the Markov
-  field and the context backoff on `X` (query ends with `X`, backing
-  off when unseen; restating the last label changes nothing).
-  `evidence` cites the query (`context_query`/`context_from`).
-- I3 streaming: `update()` rows carry global indices — history `index`
-  equals `stream_pos`, so change events and history agree across calls.
-- I4 docs: this section + README notes (changelog grown per
-  iteration; version bump only at release).
+Inputs (I1, I10): every entry point accepts any iterable
+(list/tuple/range/generator element-wise); CSV/JSON strings are
+parsed, plain strings stay single observations; bare scalars are
+rejected with a naming-the-fix TypeError.
+Prediction (I2, I20, I39): `current=X` conditions Markov AND context
+backoff (query cited in evidence); perplexity reported; per-call
+`top_k`. Streaming (I3, I40): global `index == stream_pos` rows;
+`stream_predict(top_k)`, `stream_stats()`, `stream_changes()`.
+Read-outs (I5-I9, I35): describe/top_patterns/patterns_by_type/
+pattern_card/explain_pattern/solve/state_signature.
+Management (I11-I12, I22-I24): configure (unknown keys named),
+reset, export/import, compare, summarize, forget, prune (I25).
+Analysis (I15-I19, I30-I34, I44-I47, I49): seasonality, correlation,
+regimes, change_points, frequencies, transitions, histogram, zscores,
+autocorr, moving_average, trend, graph, dtw, align, reduce,
+discretize. Results (I13, I38, I42-I43): min_severity filter,
+z_threshold override, discover ids, quality grades. Batch (I21, I26):
+detect(include_anomalies), {name: data} dict batches. Errors (I27):
+strict report formats. Demo (I48): examples/demo_v3.py.
 
 ## 2.0.0
 

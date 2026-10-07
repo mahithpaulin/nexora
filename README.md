@@ -45,7 +45,7 @@ abstention, bounded incremental streaming with online change
 detection, single-pass mining, and the `bench/` harness with
 recorded floors. Old save files still load (migrated automatically).
 
-What v3 changes over v2 (branch `v3`, PR #3, in progress — API unchanged):
+What v3 changes over v2 (v3.0.0 — API unchanged, 50 iterations):
 any iterable works wherever a list is shown (tuple/range/generator are
 iterated element-wise, not swallowed as one observation);
 `predict(data, current=X)` conditions both Markov and context backoff on
