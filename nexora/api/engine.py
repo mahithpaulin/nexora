@@ -1726,8 +1726,12 @@ class Nexora:
     def report(self, result: Any, fmt: str = "markdown") -> str:
         """Full human-readable report: fmt="markdown" (default) or "text".
 
-        Never raises on malformed results (coerces with placeholders).
+        Unknown formats raise ValueError (I27) instead of silently
+        falling back to markdown. Never raises on malformed results
+        (coerces with placeholders).
         """
+        if fmt not in ("markdown", "text"):
+            raise ValueError("fmt must be 'markdown' or 'text', got %r" % (fmt,))
         if fmt == "text":
             if _render_text is None:
                 raise ImportError("nexora.explanation.report is required")
@@ -1776,11 +1780,24 @@ class Nexora:
         """Isolated detect() per dataset (fresh engine each); returns outcomes.
 
         One bad dataset records {"error": ...} and never kills the batch.
-        See nexora.api.batch.summarize_batch / compare_signatures for
-        rollups and diffs.
+        A {name: data} dict is accepted (I26): each outcome's "index" is
+        the dataset name. See nexora.api.batch.summarize_batch /
+        compare_signatures for rollups and diffs.
         """
         if _batch_process is None:
             raise ImportError("nexora.api.batch is required")
+        if isinstance(datasets, dict):
+            out = []
+            for name, ds in datasets.items():
+                try:
+                    res = _batch_process([ds], self.config)
+                    row = dict(res[0]) if res else {"result": None, "error": "empty"}
+                    row["index"] = name
+                    out.append(row)
+                except Exception as exc:
+                    out.append({"index": name, "result": None,
+                                "error": "%s: %s" % (type(exc).__name__, exc)})
+            return out
         return _batch_process(datasets, self.config)
 
     def update(self, data: Any, *, detect_changes: bool = True) -> dict:
@@ -2309,6 +2326,93 @@ class Nexora:
         _r = "Forgot pattern '%s'." % (pid,)
         return {"forgotten": True, "reason": _r, "explanation": _r,
                 "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    def prune(self, max_total: int = 1000) -> dict:
+        """Drop retired patterns while size > max_total (I25).
+
+        Oldest-first among RETIRED states; returns removed ids.
+        """
+        try:
+            max_total = max(0, int(max_total))
+        except (TypeError, ValueError):
+            raise ValueError("max_total must be an int >= 0")
+        try:
+            removed = self.repo.prune(max_total=max_total) or []
+        except Exception:
+            removed = []
+        try:
+            left = self.repo.size()
+        except Exception:
+            left = 0
+        _r = "Pruned %d pattern(s); %d remain." % (len(removed), left)
+        return {"removed": list(removed), "remaining": left,
+                "reason": _r, "explanation": _r, "status": STATUS_FOUND,
+                "status_reason": "FOUND: " + _r}
+
+    def missing_runs(self, data: Any) -> dict:
+        """Stretches of missing values (None/NaN) with start/end/length (I28)."""
+        rows = _rows(data)
+        runs, start = [], None
+        for i, r in enumerate(rows):
+            try:
+                v = r.get("value")
+                missing = v is None or (isinstance(v, float) and v != v)
+            except Exception:
+                missing = True
+            if missing and start is None:
+                start = i
+            elif not missing and start is not None:
+                runs.append({"start": start, "end": i - 1, "length": i - start})
+                start = None
+        if start is not None:
+            runs.append({"start": start, "end": len(rows) - 1,
+                         "length": len(rows) - start})
+        if runs:
+            return {"runs": runs, "count": len(runs),
+                    "missing": sum(x["length"] for x in runs), "n": len(rows),
+                    "reason": "%d missing run(s), %d value(s) of %d." % (
+                        len(runs), sum(x["length"] for x in runs), len(rows)),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: %d missing run(s)." % len(runs)}
+        _r = "NONE: no missing values in %d observation(s)." % len(rows)
+        return {"runs": [], "count": 0, "missing": 0, "n": len(rows),
+                "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
+
+    def runs(self, data: Any) -> dict:
+        """Maximal constant-value runs with start/end/count (I29)."""
+        rows = _rows(data)
+        vals = []
+        for r in rows:
+            try:
+                vals.append(r.get("value"))
+            except Exception:
+                vals.append(None)
+        out, i = [], 0
+        while i < len(vals):
+            j = i
+            try:
+                while j + 1 < len(vals) and vals[j + 1] == vals[i] \
+                        and not (isinstance(vals[i], float) and vals[i] != vals[i]):
+                    j += 1
+            except Exception:
+                pass
+            try:
+                key = vals[i]
+                disp = None if (isinstance(key, float) and key != key) else key
+            except Exception:
+                disp = None
+            out.append({"value": disp, "start": i, "end": j, "count": j - i + 1})
+            i = j + 1
+        if out:
+            return {"runs": out, "count": len(out), "n": len(rows),
+                    "reason": "%d run(s) in %d observation(s)." % (len(out), len(rows)),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: %d run(s)." % len(out)}
+        _r = "NONE: no observations to scan."
+        return {"runs": [], "count": 0, "n": 0,
+                "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
 
     # ---- v3 analysis wrappers (batch C): additive read-only views. ----
 
