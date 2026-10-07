@@ -15,7 +15,8 @@ def test_match_threshold():
 
 def test_discover_max_n():
     nx = Nexora()
-    assert nx.discover(list("ABCABCABC"), max_n=2)["status"] in ("FOUND", "NONE")
+    d = nx.discover(list("ABCABCABC"), max_n=2)
+    assert "ids" in d and d["status"] in ("FOUND", "NONE", "LOW_CONFIDENCE")
     with pytest.raises(ValueError):
         nx.discover(list("ABC"), max_n=11)
 
