@@ -3904,3 +3904,103 @@ class Nexora:
         return {"indices": [], "points": [], "fences": [lo, hi],
                 "reason": _r, "explanation": _r,
                 "status": STATUS_NONE, "status_reason": "NONE: " + _r}
+
+    # ---- v3 loop 2, batch O: persistence + sharing. ----
+
+    def snapshot(self) -> dict:
+        """In-memory JSON-safe state: config + patterns + trails (I76)."""
+        exp = self.export_patterns()
+        try:
+            import json as _js
+            snap = {"v": 1, "config": dict(self.config),
+                    "patterns": exp.get("patterns", []),
+                    "trails": {str(k): list(v) for k, v in self._trail.items()}
+                    if isinstance(self._trail, dict) else {}}
+            _js.dumps(snap)
+        except Exception as exc:
+            raise ValueError("snapshot failed: %s" % exc)
+        return {"snapshot": snap, "patterns": exp.get("count", 0),
+                "reason": "Snapshot of %d pattern(s)." % exp.get("count", 0),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: snapshot ready."}
+
+    def restore(self, snap: dict) -> dict:
+        """Restore a snapshot() dict, replacing memory + config (I77)."""
+        if not isinstance(snap, dict) or snap.get("v") != 1:
+            raise ValueError("snap must be a snapshot() v1 dict")
+        if _validate_config is None or PatternRepository is None:
+            raise ImportError("nexora core modules are required")
+        try:
+            cfg = _validate_config(snap.get("config", {}))
+        except Exception as exc:
+            raise ValueError("bad snapshot config: %s" % exc)
+        fresh = PatternRepository()
+        n = 0
+        for p in (snap.get("patterns", []) or []):
+            try:
+                fresh.import_patterns([dict(p)])
+                n += 1
+            except Exception:
+                continue
+        self.repo = fresh
+        self.config = cfg
+        try:
+            self._trail = {str(k): list(v) for k, v in (snap.get("trails", {}) or {}).items()}
+        except Exception:
+            self._trail = {}
+        self._snaps = {}
+        _r = "Restored %d pattern(s)." % n
+        return {"patterns": n, "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    def share(self, pid: str) -> dict:
+        """Single-pattern JSON-safe export (I78)."""
+        p = self.get_pattern(pid)
+        if not isinstance(p, dict):
+            _r = "NONE: no pattern '%s' stored." % (pid,)
+            return {"pattern": None, "reason": _r, "explanation": _r,
+                    "status": STATUS_NONE, "status_reason": _r}
+        import copy as _copy
+        try:
+            import json as _js
+            cp = _copy.deepcopy(p)
+            _js.dumps(cp)
+        except Exception:
+            cp = {k: v for k, v in p.items() if isinstance(v, (str, int, float, list, dict))}
+        return {"pattern": cp, "reason": "Shared %s." % (pid,),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: shared %s." % (pid,)}
+
+    def adopt(self, pattern: dict) -> dict:
+        """Adopt one shared pattern dict (I79)."""
+        if not isinstance(pattern, dict) or pattern.get("id") is None:
+            raise ValueError("pattern must be a dict with an 'id'")
+        before = {str(p.get("id")) for p in self.repo.all() if isinstance(p, dict)}
+        try:
+            self.repo.import_patterns([dict(pattern)])
+        except Exception as exc:
+            raise ValueError("adopt failed: %s" % exc)
+        if str(pattern.get("id")) in before:
+            _r = "Merged with existing %s." % (pattern.get("id"),)
+        else:
+            _r = "Adopted %s." % (pattern.get("id"),)
+        return {"id": str(pattern.get("id")), "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    def merge(self, other: Any) -> dict:
+        """Import another engine's (or list's) patterns (I80)."""
+        try:
+            theirs = [p for p in other.repo.all() if isinstance(p, dict)] \
+                if hasattr(other, "repo") else list(other or [])
+        except Exception:
+            theirs = []
+        try:
+            before = self.repo.size()
+            got = self.import_patterns(theirs)
+            added = self.repo.size() - before
+        except Exception as exc:
+            raise ValueError("merge failed: %s" % exc)
+        _r = "Merged %d new pattern(s) (%d offered)." % (added, got.get("imported", 0))
+        return {"added": added, "offered": got.get("imported", 0),
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
