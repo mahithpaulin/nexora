@@ -3213,3 +3213,197 @@ class Nexora:
         return {"median_dt": med, "gaps": [],
                 "reason": _r, "explanation": _r,
                 "status": STATUS_NONE, "status_reason": "NONE: " + _r}
+
+    # ---- v3 loop 2, batch K: prediction depth. ----
+
+    def forecast(self, data: Any, steps: int = 3) -> dict:
+        """Multi-step numeric forecast: rule first, trend fallback (I56)."""
+        try:
+            steps = max(1, int(steps))
+        except (TypeError, ValueError):
+            steps = 3
+        vals = self._numeric_values(_rows(data))
+        if len(vals) < 3:
+            _r = "INSUFFICIENT_DATA: need >= 3 numerics, got %d." % len(vals)
+            return {"steps": [], "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        nxt, source = [], "trend"
+        if _analyze_seq is not None:
+            try:
+                sol = _analyze_seq(vals, steps=steps) or {}
+                if sol.get("kind") not in (None, "unknown") and sol.get("next"):
+                    nxt, source = list(sol["next"]), "arithmetic:%s" % sol.get("kind")
+            except Exception:
+                pass
+        if not nxt and detect_trend is not None:
+            try:
+                tr = detect_trend(vals) or {}
+                slope = float(tr.get("slope", 0.0) or 0.0)
+                nxt = [vals[-1] + slope * k for k in range(1, steps + 1)]
+            except Exception:
+                nxt = []
+        if not nxt:
+            _r = "NONE: no forecastable structure."
+            return {"steps": [], "source": "none", "reason": _r,
+                    "explanation": _r, "status": STATUS_NONE,
+                    "status_reason": _r}
+        _r = "%d-step forecast via %s." % (len(nxt), source)
+        return {"steps": nxt, "source": source, "reason": _r,
+                "explanation": _r, "status": STATUS_FOUND,
+                "status_reason": "FOUND: " + _r}
+
+    def backtest(self, data: Any, max_trials: int = 200) -> dict:
+        """Walk-forward top-1 hit rate over prefixes (I57).
+
+        Trains the Markov model on labels[:i], predicts position i.
+        Caps at max_trials most recent positions (cited when truncated).
+        """
+        if build_transition_matrix is None or predict_next is None:
+            raise ImportError("nexora.prediction.markov is required")
+        try:
+            max_trials = max(1, int(max_trials))
+        except (TypeError, ValueError):
+            max_trials = 200
+        labels = [r.get("label") for r in _rows(data)]
+        clean = [x for x in labels
+                 if x is not None and not (isinstance(x, float) and x != x)]
+        if len(clean) < 3:
+            _r = "INSUFFICIENT_DATA: need >= 3 usable labels."
+            return {"accuracy": None, "hits": 0, "trials": 0, "reason": _r,
+                    "explanation": _r, "status": STATUS_INSUFFICIENT,
+                    "status_reason": _r}
+        idx = list(range(1, len(clean)))[-max_trials:]
+        trunc = len(clean) - 1 - len(idx)
+        hits = 0
+        for i in idx:
+            try:
+                m = build_transition_matrix(clean[:i])
+                p = predict_next(clean[i - 1], m, top_k=1)
+                if p and p[0].get("next") == clean[i]:
+                    hits += 1
+            except Exception:
+                continue
+        acc = hits / len(idx) if idx else 0.0
+        _r = "Walk-forward accuracy %.3f (%d/%d%s)." % (
+            acc, hits, len(idx), "; truncated %d" % trunc if trunc else "")
+        return {"accuracy": acc, "hits": hits, "trials": len(idx),
+                "truncated": trunc, "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    def surprises(self, data: Any, k: int = 5) -> dict:
+        """Least-predictable positions under the context model (I58)."""
+        if build_context_model is None or predict_with_context is None:
+            raise ImportError("nexora.prediction.context is required")
+        try:
+            k = max(1, int(k))
+        except (TypeError, ValueError):
+            k = 5
+        import math as _m
+        labels = [r.get("label") for r in _rows(data)]
+        clean = [x for x in labels
+                 if x is not None and not (isinstance(x, float) and x != x)]
+        if len(clean) < 3:
+            _r = "INSUFFICIENT_DATA: need >= 3 usable labels."
+            return {"points": [], "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        try:
+            mo = max(0, int(self.config.get("context_order", 2)))
+        except (TypeError, ValueError):
+            mo = 2
+        cap = min(len(clean), 500)
+        trunc = len(clean) - cap
+        model = build_context_model(clean[:cap], mo)
+        scored = []
+        for i in range(1, cap):
+            actual = clean[i]
+            ctx = clean[max(0, i - mo):i]
+            try:
+                cands = predict_with_context(model, ctx, top_k=1000) or []
+            except Exception:
+                cands = []
+            p = 0.0
+            for c in cands:
+                try:
+                    if c.get("next") == actual:
+                        p = float(c.get("probability", 0.0))
+                        break
+                except Exception:
+                    continue
+            nll = (-_m.log2(p)) if p > 0 else float("inf")
+            scored.append({"index": i, "label": actual, "p": p, "nll": nll})
+        scored.sort(key=lambda d: (-(d["nll"] if d["nll"] != float("inf") else 1e9),
+                                   str(d["label"])))
+        top = scored[:k]
+        for d in top:
+            if d["nll"] == float("inf"):
+                d["nll"] = "unseen"
+        _r = "%d surprise(s) over %d scored%s." % (
+            len(top), cap, "; truncated %d" % trunc if trunc else "")
+        return {"points": top, "scored": cap, "truncated": trunc,
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    def markov_table(self, data: Any) -> dict:
+        """P(next|current) table from bigram counts (I59)."""
+        if build_transition_matrix is None:
+            raise ImportError("nexora.prediction.markov is required")
+        labels = [r.get("label") for r in _rows(data)]
+        clean = [x for x in labels
+                 if x is not None and not (isinstance(x, float) and x != x)]
+        if len(clean) < 2:
+            _r = "INSUFFICIENT_DATA: need >= 2 usable labels."
+            return {"table": {}, "states": [], "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        try:
+            m = build_transition_matrix(clean)
+        except Exception as exc:
+            raise ValueError("markov_table failed: %s" % exc)
+        counts = m.get("counts", {}) if isinstance(m, dict) else {}
+        totals = collections.Counter()
+        for (a, _b), c in counts.items():
+            try:
+                totals[a] += c
+            except TypeError:
+                continue
+        table = {}
+        for (a, b), c in counts.items():
+            try:
+                table.setdefault(str(a), {})[str(b)] = (c / totals[a]) if totals[a] else 0.0
+            except TypeError:
+                continue
+        return {"table": table, "states": (m.get("states", []) if isinstance(m, dict) else []),
+                "reason": "Markov table over %d state(s)." % len(table),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: markov table ready."}
+
+    def vocabulary(self, data: Any, top_k: int = 20) -> dict:
+        """Distinct labels with counts (I60)."""
+        try:
+            top_k = max(1, int(top_k))
+        except (TypeError, ValueError):
+            top_k = 20
+        cnt = collections.Counter()
+        for r in _rows(data):
+            try:
+                lab = r.get("label")
+            except Exception:
+                continue
+            if lab is None or (isinstance(lab, float) and lab != lab):
+                continue
+            try:
+                cnt[str(lab)] += 1
+            except Exception:
+                continue
+        total = sum(cnt.values())
+        table = [{"label": k, "count": c, "fraction": c / total}
+                 for k, c in cnt.most_common(top_k)] if total else []
+        if table:
+            return {"labels": table, "distinct": len(cnt), "n": total,
+                    "count": len(cnt),
+                    "reason": "%d distinct label(s)." % len(cnt),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: vocabulary ready."}
+        _r = "NONE: no labels present."
+        return {"labels": [], "distinct": 0, "count": 0, "n": 0,
+                "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
