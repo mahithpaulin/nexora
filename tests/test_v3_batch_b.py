@@ -59,3 +59,14 @@ def test_min_severity_filter():
     assert nx.find_anomalies(data, min_severity="low")["count"] == len(all_hits)
     with pytest.raises(ValueError, match="low/medium/high/critical"):
         nx.find_anomalies(data, min_severity="extreme")
+
+
+def test_match_top():
+    nx = Nexora()
+    assert nx.match_top("A")["status"] == "NONE"
+    nx.discover(list("ABCABCABC"))
+    hit = nx.match_top("A")
+    assert hit["status"] == "FOUND" and hit["matched"] is True
+    assert hit["ranked"] >= 1
+    miss = nx.match_top("ZZZ-nope")
+    assert miss["status"] == "NONE" and miss["matched"] is False

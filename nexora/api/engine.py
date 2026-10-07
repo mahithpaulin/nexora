@@ -1179,6 +1179,39 @@ class Nexora:
         res.sort(key=lambda d: (-d["similarity"], str(d["pattern_id"])))
         return res
 
+    def match_top(self, observation: Any) -> dict:
+        """Best single match for one observation (I14).
+
+        match() returns the full ranking (kept for compatibility);
+        match_top() answers "what is this most like?" with one status
+        envelope: {"pattern_id", "similarity", "matched", "explanation",
+        "ranked" (total compared), "status", ...}. NONE when nothing is
+        stored or nothing reaches the threshold.
+        """
+        ranked = self.match(observation)
+        if not ranked:
+            _r = "NONE: no patterns stored; run discover() first."
+            return {"pattern_id": None, "similarity": 0.0, "matched": False,
+                    "explanation": _r, "ranked": 0, "reason": _r,
+                    "status": STATUS_NONE, "status_reason": _r}
+        best = ranked[0]
+        if best.get("matched"):
+            return {"pattern_id": best.get("pattern_id"),
+                    "similarity": best.get("similarity", 0.0),
+                    "matched": True, "explanation": best.get("explanation", ""),
+                    "ranked": len(ranked),
+                    "reason": best.get("explanation", ""),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: best of %d (sim=%.3f)." % (
+                        len(ranked), best.get("similarity", 0.0))}
+        _r = ("NONE: best of %d below threshold %.2f (sim=%.3f)."
+              % (len(ranked), _MATCH_THRESHOLD, best.get("similarity", 0.0)))
+        return {"pattern_id": best.get("pattern_id"),
+                "similarity": best.get("similarity", 0.0),
+                "matched": False, "ranked": len(ranked),
+                "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
+
     def detect(self, data: Any) -> dict:
         """discover + match in one pass over the data."""
         disc = self.discover(data)
