@@ -4029,3 +4029,204 @@ class Nexora:
         return {"added": added, "strengthened": kept - added, "offered": offered,
                 "reason": _r, "explanation": _r,
                 "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    # ---- v3 loop 2, batch P: simulation + comparison. ----
+
+    def simulate(self, data: Any, steps: int = 10, seed: int = 42,
+                 start: Any = None) -> dict:
+        """Seeded random walk from the Markov model (I81).
+
+        Deterministic for a given seed. Stops early with "dead_end"
+        when the walk reaches a state with no outgoing transitions.
+        """
+        if build_transition_matrix is None:
+            raise ImportError("nexora.prediction.markov is required")
+        try:
+            steps = int(steps)
+            seed = int(seed)
+        except (TypeError, ValueError):
+            raise ValueError("steps must be >= 1 and seed an int")
+        if steps is True or steps < 1:
+            raise ValueError("steps must be >= 1 and seed an int")
+        import random as _rnd
+        labels = [r.get("label") for r in _rows(data)]
+        clean = [x for x in labels
+                 if x is not None and not (isinstance(x, float) and x != x)]
+        if len(clean) < 2:
+            _r = "INSUFFICIENT_DATA: need >= 2 usable labels."
+            return {"walk": [], "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        try:
+            m = build_transition_matrix(clean)
+        except Exception as exc:
+            raise ValueError("simulate failed: %s" % exc)
+        counts = m.get("counts", {}) if isinstance(m, dict) else {}
+        outs = collections.defaultdict(list)
+        for (a, b), c in counts.items():
+            try:
+                outs[a].append((b, int(c)))
+            except (TypeError, ValueError):
+                continue
+        rng = _rnd.Random(seed)
+        cur = start if start is not None else clean[-1]
+        walk, dead = [], False
+        for _ in range(steps):
+            cands = outs.get(cur, [])
+            tot = sum(c for _, c in cands)
+            if not cands or tot <= 0:
+                dead = True
+                break
+            r = rng.randrange(tot)
+            for b, c in sorted(cands, key=lambda t: str(t[0])):
+                r -= c
+                if r < 0:
+                    cur = b
+                    break
+            walk.append(cur)
+        _r = "Walked %d step(s)%s from '%s'." % (len(walk), " (dead end)" if dead else "", clean[-1] if start is None else start)
+        return {"walk": walk, "start": clean[-1] if start is None else start,
+                "dead_end": dead, "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    def sequence_prob(self, data: Any, seq: Any) -> dict:
+        """Joint probability of a label sequence under Markov (I82)."""
+        if build_transition_matrix is None:
+            raise ImportError("nexora.prediction.markov is required")
+        labels = [r.get("label") for r in _rows(data)]
+        clean = [x for x in labels
+                 if x is not None and not (isinstance(x, float) and x != x)]
+        try:
+            seq = list(seq) if not isinstance(seq, (str, bytes)) else [seq]
+        except TypeError:
+            raise ValueError("seq must be an iterable of labels")
+        if len(clean) < 2 or len(seq) < 2:
+            _r = "INSUFFICIENT_DATA: need >= 2 model labels and >= 2 query labels."
+            return {"probability": 0.0, "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        try:
+            m = build_transition_matrix(clean)
+        except Exception as exc:
+            raise ValueError("sequence_prob failed: %s" % exc)
+        counts = m.get("counts", {}) if isinstance(m, dict) else {}
+        totals = collections.Counter()
+        for (a, _b), c in counts.items():
+            try:
+                totals[a] += c
+            except TypeError:
+                continue
+        p, steps_used = 1.0, []
+        for a, b in zip(seq, seq[1:]):
+            try:
+                c = counts.get((a, b), 0)
+                t = totals.get(a, 0)
+            except TypeError:
+                c, t = 0, 0
+            step = (c / t) if t else 0.0
+            steps_used.append(step)
+            p *= step
+            if p == 0.0:
+                break
+        _r = "P(%s) = %.4g." % (list(seq), p)
+        return {"probability": p, "steps": steps_used,
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    def predict_proba(self, data: Any, candidate: Any,
+                      current: Any = None) -> dict:
+        """P(one candidate is next), Markov + context cited (I83)."""
+        full = self.predict(data, current=current)
+        if full.get("status") == STATUS_INSUFFICIENT:
+            return {"candidate": candidate, "probability": 0.0,
+                    "reason": full.get("reason", ""),
+                    "explanation": full.get("explanation", ""),
+                    "status": STATUS_INSUFFICIENT,
+                    "status_reason": full.get("status_reason", "")}
+        pm, pc = 0.0, 0.0
+        for entry in (full.get("predictions", []) or []):
+            try:
+                if entry.get("next") == candidate:
+                    pm = float(entry.get("probability", 0.0))
+                    break
+            except Exception:
+                continue
+        for entry in (full.get("context", []) or []):
+            try:
+                if entry.get("next") == candidate:
+                    pc = float(entry.get("probability", 0.0))
+                    break
+            except Exception:
+                continue
+        p = max(pm, pc)
+        _r = "P(%r next) = %.4g (markov %.4g, context %.4g)." % (candidate, p, pm, pc)
+        return {"candidate": candidate, "probability": p,
+                "markov": pm, "context": pc,
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND if p > 0 else STATUS_NONE,
+                "status_reason": ("FOUND: " + _r if p > 0 else "NONE: " + _r)}
+
+    def divergence(self, a: Any, b: Any) -> dict:
+        """L1 distance between two value-distributions, 0..2 (I84)."""
+        fa = self.frequencies(a)
+        fb = self.frequencies(b)
+        if fa["status"] != STATUS_FOUND or fb["status"] != STATUS_FOUND:
+            _r = "INSUFFICIENT_DATA: two non-empty datasets required."
+            return {"l1": None, "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        # full distributions (uncapped counts, not the top-k views).
+        ca = collections.Counter()
+        for r in _rows(a):
+            try:
+                v = r.get("value")
+                if v is None or v != v:
+                    continue
+                ca[str(v) if not isinstance(v, str) else v] += 1
+            except Exception:
+                continue
+        cb = collections.Counter()
+        for r in _rows(b):
+            try:
+                v = r.get("value")
+                if v is None or v != v:
+                    continue
+                cb[str(v) if not isinstance(v, str) else v] += 1
+            except Exception:
+                continue
+        ta, tb = sum(ca.values()), sum(cb.values())
+        l1 = sum(abs(ca.get(k, 0) / ta - cb.get(k, 0) / tb) for k in set(ca) | set(cb)) \
+            if ta and tb else 2.0
+        _r = "L1 divergence %.4f." % l1
+        return {"l1": l1, "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    def seasonal_forecast(self, data: Any, steps: int = 3) -> dict:
+        """Extend the stored seasonal cycle forward (I85)."""
+        try:
+            steps = max(1, int(steps))
+        except (TypeError, ValueError):
+            steps = 3
+        vals = self._numeric_values(_rows(data))
+        best = None
+        try:
+            for sp in self.repo.all():
+                if not isinstance(sp, dict) or sp.get("type") != "seasonal":
+                    continue
+                ff = sp.get("features", {}) or {}
+                pp = int(ff.get("period", 0) or 0)
+                ss = float(ff.get("seasonal_strength", 0.0) or 0.0)
+                sq = list(sp.get("sequence", []) or [])
+                if pp >= 2 and ss >= 0.5 and len(sq) >= pp:
+                    if best is None or ss > best[0]:
+                        best = (ss, pp, sq)
+        except Exception:
+            best = None
+        if best is None:
+            _r = "NONE: no qualifying stored seasonal pattern; run discover() on cyclic data."
+            return {"steps": [], "reason": _r, "explanation": _r,
+                    "status": STATUS_NONE, "status_reason": _r}
+        _ss, pp, sq = best
+        start = len(vals) % pp if vals else 0
+        nxt = [sq[(start + k) % pp] for k in range(steps)]
+        _r = "%d-step seasonal forecast (period %d)." % (len(nxt), pp)
+        return {"steps": nxt, "period": pp,
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
