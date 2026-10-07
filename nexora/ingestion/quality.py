@@ -54,9 +54,11 @@ def _outlier_fraction(nums):
 def quality_report(data):
     """Assess raw list quality; never raises on ordinary data.
 
-    Accepts list/tuple/None of numbers/strings/None/NaN/dicts (dicts use
-    first present key among value/v/x/val/y, else the dict itself); None
-    is treated as []. Non-list/tuple/None raises TypeError.
+    Accepts any iterable of numbers/strings/None/NaN/dicts (list, tuple,
+    range, generator, ... — all iterated element-wise) or None (treated
+    as []); dicts use first present key among value/v/x/val/y, else the
+    dict itself. A bare str/bytes/dict/int raises TypeError (wrap a single
+    value as [value]).
     Returns {n:int, missing:int, missing_fraction:[0,1],
     numeric_fraction:[0,1] of non-missing that are numeric (0.0 if none
     present), constant:bool (all present equal; False if none present),
@@ -66,12 +68,21 @@ def quality_report(data):
     """
     if data is None:
         data = []
-    elif isinstance(data, tuple):
-        data = list(data)
     elif isinstance(data, list):
         pass
+    elif isinstance(data, tuple):
+        data = list(data)
+    elif isinstance(data, (str, bytes, dict, int, float, bool)):
+        raise TypeError(
+            "data must be an iterable of values (list, tuple, range, "
+            "generator, ...) or None; wrap a single value as [value]")
     else:
-        raise TypeError("data must be a list, tuple, or None")
+        try:
+            data = list(data)
+        except TypeError:
+            raise TypeError(
+                "data must be an iterable of values (list, tuple, range, "
+                "generator, ...) or None; wrap a single value as [value]")
     n = len(data)
     if n == 0:
         return {"n": 0, "missing": 0, "missing_fraction": 0.0, "numeric_fraction": 0.0, "constant": False, "outlier_fraction": 0.0, "quality": 0.0, "warnings": ["empty data"], "reason": "empty data"}

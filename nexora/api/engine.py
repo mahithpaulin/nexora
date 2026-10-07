@@ -205,14 +205,31 @@ def _rows(data):
             return []
         except Exception:
             return []
+    # v3: every engine method accepts any iterable of observations
+    # (list, tuple, range, generator, ...) element-wise. A single scalar
+    # or row-dict is wrapped as one observation; bare strings stay single
+    # observations here (file paths handled above, CSV text via parse()).
+    if isinstance(data, list):
+        seq = data
+    elif isinstance(data, dict):
+        seq = [data]
+    elif isinstance(data, (str, bytes)):
+        seq = [data]
+    elif isinstance(data, tuple):
+        seq = list(data)
+    else:
+        try:
+            seq = list(data)
+        except TypeError:
+            seq = [data]
     if normalize_observations is not None:
         try:
-            r = normalize_observations(data)
+            r = normalize_observations(seq)
             if r:
                 return list(r)
+            return []
         except Exception:
             pass
-    seq = data if isinstance(data, list) else [data]
     out = []
     for i, item in enumerate(seq):
         if isinstance(item, dict):
@@ -1574,9 +1591,9 @@ class Nexora:
         return str(result)
 
     def quality(self, data: Any) -> dict:
-        """Data-quality report: raw lists, or a file path (parsed, then raw values assessed).
+        """Data-quality report: raw iterables, or a file path (parsed, then raw values assessed).
 
-        Never raises on ordinary data. Raises TypeError for non-list /
+        Never raises on ordinary data. Raises TypeError for non-iterable /
         non-path input, FileNotFoundError for a missing PathLike.
         """
         if _quality_report is None:

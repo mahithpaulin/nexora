@@ -58,8 +58,10 @@ def parse(data: Any) -> List[Dict[str, Any]]:
     """Parse input into normalized observation rows.
 
     What it computes: list of {"index","value","label","timestamp","raw"}
-    rows via observation.normalize_observations. Accepts a list (passed
-    through), a JSON string encoding a list/dict/scalar, a CSV string
+    rows via observation.normalize_observations. Accepts any iterable of
+    observations (list, tuple, range, generator, ... — all iterated
+    element-wise), a single row dict (wrapped as one row), a JSON string
+    encoding a list/dict/scalar, a CSV string
     (header row optional; empty cells -> None/missing), or a file path
     (str pointing at an existing file, or os.PathLike): the file is read
     (utf-8, latin-1 fallback, transparent .gz) and parsed by extension
@@ -71,6 +73,9 @@ def parse(data: Any) -> List[Dict[str, Any]]:
         return []
     if isinstance(data, (list, tuple)):
         return normalize_observations(list(data))
+    if isinstance(data, dict):
+        # A single row dict (not a JSON string): wrap it.
+        return normalize_observations([data])
     if isinstance(data, os.PathLike):
         return parse(_read_text_file(os.fspath(data)))
     if isinstance(data, str) and os.path.exists(data) and os.path.isfile(data):
@@ -78,8 +83,21 @@ def parse(data: Any) -> List[Dict[str, Any]]:
         if data.endswith(".json") or data.endswith(".json.gz"):
             return parse(text)  # JSON content path
         return parse(text)
+    if isinstance(data, (str, bytes)):
+        pass  # CSV/JSON text: handled below
+    elif isinstance(data, (int, float, bool)):
+        raise TypeError(
+            "parse() expects an iterable of observations, a CSV/JSON string, "
+            "or a file path; wrap a single value as [value]")
+    else:
+        try:
+            return normalize_observations(list(data))
+        except TypeError:
+            raise TypeError(
+                "parse() expects an iterable of observations, a CSV/JSON string, "
+                "or a file path; wrap a single value as [value]")
     if not isinstance(data, str):
-        raise TypeError("parse() expects a list, CSV/JSON string, or file path")
+        raise TypeError("parse() expects an iterable of observations, a CSV/JSON string, or a file path; wrap a single value as [value]")
     s = data.strip()
     if not s:
         return []

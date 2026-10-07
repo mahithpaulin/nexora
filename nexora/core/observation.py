@@ -57,13 +57,31 @@ def normalize_observations(data: Any) -> List[Dict[str, Any]]:
     What it computes: one dict per input element with keys:
       index (int, position in input), value (float|str|None),
       label (str|None), timestamp (int|float|None), raw (original item).
-    Accepts list[float|int|str|dict] and None items. None input yields [].
-    Never crashes on None/missing items; they become value=None rows.
+    Accepts any iterable of observations: list, tuple, range, generator,
+    or other sequences/iterables (all iterated element-wise). None input
+    yields []. A single scalar (str/int/float/dict) is NOT iterated:
+    wrap it as [item] — a TypeError says so. Never crashes on
+    None/missing items; they become value=None rows.
     """
     if data is None:
         return []
+    if isinstance(data, (str, bytes)):
+        raise TypeError(
+            "normalize_observations() expects an iterable of observations, "
+            "got a bare string; wrap a single value as [value] "
+            "(plain strings are also parsed via nexora.ingestion.parser.parse)")
+    if isinstance(data, dict):
+        raise TypeError(
+            "normalize_observations() expects an iterable of observations, "
+            "got a bare dict; wrap a single row as [row]")
     if not isinstance(data, (list, tuple)):
-        raise TypeError("normalize_observations() expects a list or tuple")
+        try:
+            data = list(data)
+        except TypeError:
+            raise TypeError(
+                "normalize_observations() expects an iterable of observations "
+                "(list, tuple, range, generator, ...); wrap a single value "
+                "as [value]")
     rows: List[Dict[str, Any]] = []
     for i, item in enumerate(data):
         if item is None:

@@ -33,8 +33,10 @@ before trusting an output.
 
 ## Input and ingestion quirks (pre-existing, preserved for compatibility)
 
-- Only `list` inputs are iterated element-wise; a tuple/range/generator
-  is treated as ONE observation. Pass `list(data)`.
+- v3: every engine entry point (plus `parse`/`quality_report`)
+  iterates any iterable element-wise (list, tuple, range, generator,
+  ...). A bare scalar or row-dict is one observation, and the
+  TypeError names the fix (`wrap a single value as [value]`).
 - The ingestion normalizer coerces `True` -> `1.0` and labels numerics
   `None`. `None`/`NaN` labels never form patterns (they are skipped in
   mining and scoring), which is why pure-numeric discovers show no
