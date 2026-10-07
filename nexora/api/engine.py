@@ -682,7 +682,7 @@ class Nexora:
             _r = ("INSUFFICIENT_DATA: need >= %d observation(s), got %d; nothing examined."
                   % (_min_d, len(rows)))
             return {"patterns": [], "count": 0, "reason": _r, "explanation": _r,
-                    "evidence": {}, "new_patterns": [],
+                    "evidence": {}, "new_patterns": [], "ids": [],
                     "status": STATUS_INSUFFICIENT, "status_reason": _r}
         try:
             ids_before = set(str(_p.get("id")) for _p in self.repo.all() if isinstance(_p, dict))
@@ -1175,6 +1175,8 @@ class Nexora:
                            _sig_ev.get("dropped", 0), min_sup))
         return {"patterns": pats, "count": len(pats), "reason": expl, "explanation": expl,
                 "evidence": ev, "new_patterns": new_pats,
+                # I42: ids alongside full dicts for set logic.
+                "ids": [p.get("id") for p in pats if isinstance(p, dict)],
                 "status": _status, "status_reason": _sreason}
 
     def match(self, observation: Any) -> list:
@@ -1743,6 +1745,13 @@ class Nexora:
             _qn = int(rep.get("n", 0) or 0)
         except (TypeError, ValueError):
             _qn = 0
+        # I43: letter grade for the 0..1 quality score.
+        try:
+            _q = float(rep.get("quality", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            _q = 0.0
+        rep["grade"] = ("A" if _q >= 0.9 else "B" if _q >= 0.75
+                        else "C" if _q >= 0.5 else "D" if _q >= 0.25 else "F")
         if _qn == 0:
             rep["status"] = STATUS_INSUFFICIENT
             rep["status_reason"] = "INSUFFICIENT_DATA: no observations to assess."
@@ -1974,16 +1983,23 @@ class Nexora:
                 "status_reason": ("FOUND: streamed %d observation(s)." % len(rows)
                                   if rows else "NONE: empty chunk; state unchanged.")}
 
-    def stream_predict(self, current: Any = None) -> dict:
+    def stream_predict(self, current: Any = None, top_k: int = 3) -> dict:
         """Next-symbol prediction from the incremental stream model (WS7).
 
         Same MLE math as the batch Markov path, over transition counts
         maintained by update() (no history scan). Returns {"current",
         "predictions", "n", "reason"}; empty predictions when the
         current label has no recorded outgoing transitions.
+        top_k (I40): candidates kept; None uses 3.
         """
         if build_transition_matrix is None or predict_next is None:
             raise ImportError("nexora.prediction.markov is required")
+        try:
+            _tk = 3 if top_k is None else int(top_k)
+        except (TypeError, ValueError):
+            raise ValueError("top_k must be an int >= 1")
+        if _tk is True or _tk < 1:
+            raise ValueError("top_k must be an int >= 1")
         cur = current if current is not None else self._stream_prev
         if cur is _STREAM_UNSET:
             cur = None
@@ -1994,7 +2010,7 @@ class Nexora:
         except Exception:
             matrix = {"states": [], "counts": {}, "probs": {}}
         try:
-            preds = predict_next(cur, matrix, top_k=3) if cur is not None else []
+            preds = predict_next(cur, matrix, top_k=_tk) if cur is not None else []
         except Exception:
             preds = []
         return {"current": cur, "predictions": preds, "n": self._stream_n,
@@ -2862,3 +2878,70 @@ class Nexora:
                 "reason": "State signature %s over %d pattern(s)." % (sig, len(all_p)),
                 "status": STATUS_FOUND,
                 "status_reason": "FOUND: signature computed."}
+
+    # ---- v3 config + structure (batch H tail). ----
+
+    def config_help(self, key: str | None = None) -> dict:
+        """Human-readable config key documentation (I41).
+
+        No args: all keys. One key: its description (NONE when unknown,
+        naming the closest valid keys is overkill — the full list ships).
+        """
+        try:
+            from nexora.core.config import KEY_DOCS as _docs
+        except ImportError:
+            _docs = {}
+        docs = dict(_docs) if isinstance(_docs, dict) else {}
+        # Document every defaulted key even if docs lag behind.
+        for k in DEFAULT_CONFIG:
+            docs.setdefault(k, "No description yet.")
+        if key is None:
+            return {"docs": docs, "count": len(docs),
+                    "reason": "%d config key(s) documented." % len(docs),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: config documented."}
+        if str(key) in docs:
+            return {"key": str(key), "doc": docs[str(key)],
+                    "reason": "%s: %s" % (key, docs[str(key)]),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: %s documented." % (key,)}
+        _r = "NONE: unknown config key '%s'." % (key,)
+        return {"key": str(key), "doc": "", "valid_keys": sorted(docs),
+                "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
+
+    def graph(self, data: Any, window: int = 2) -> dict:
+        """Label co-occurrence graph summary (I44).
+
+        Nodes, edge count, components and top edges by weight.
+        """
+        if _co_graph is None:
+            raise ImportError("nexora.features.structural is required")
+        try:
+            window = max(1, int(window))
+        except (TypeError, ValueError):
+            window = 2
+        labels = [r.get("label") for r in _rows(data)]
+        try:
+            g = _co_graph(labels, window=window) or {}
+        except Exception:
+            g = {}
+        nodes = list((g.get("nodes", []) or [])) if isinstance(g, dict) else []
+        edges = dict(g.get("edges", {}) or {}) if isinstance(g, dict) else {}
+        try:
+            comps = _co_comps(g) if (_co_comps is not None and isinstance(g, dict)) else []
+        except Exception:
+            comps = []
+        top = sorted(edges.items(), key=lambda kv: (-kv[1], str(kv[0])))[:10]
+        if nodes:
+            return {"nodes": len(nodes), "edges": len(edges),
+                    "components": len(comps) if isinstance(comps, list) else 0,
+                    "top_edges": [{"pair": list(k) if isinstance(k, (list, tuple)) else str(k),
+                                   "weight": v} for k, v in top],
+                    "reason": "%d node(s), %d edge(s)." % (len(nodes), len(edges)),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: graph built."}
+        _r = "NONE: no graph nodes from %d observation(s)." % len(labels)
+        return {"nodes": 0, "edges": 0, "components": 0, "top_edges": [],
+                "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
