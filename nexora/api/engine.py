@@ -651,7 +651,7 @@ class Nexora:
         return pid
 
     def discover(self, data: Any, *, show_all: bool = False,
-                 min_support: int | None = None) -> dict:
+                 min_support: int | None = None, max_n: int | None = None) -> dict:
         """Find recurring values + frequent sequences; store them; return evidence.
 
         Closed-pattern pruning (WS2) drops a recurring/sequential
@@ -660,6 +660,7 @@ class Nexora:
         prune_redundant=False) to store every candidate.
         min_support (I37): per-call support floor (validated int >= 1);
         None (default) uses the config value.
+        max_n (I92): per-call n-gram ceiling (int 2..10); None uses config.
         """
         rows = _rows(data)
         values = [r["value"] for r in rows]
@@ -747,7 +748,16 @@ class Nexora:
         seqs = []
         if find_frequent_sequences is not None:
             try:
-                seqs = find_frequent_sequences(labels, int(self.config.get("max_n", 3)), min_sup) or []
+                if max_n is None:
+                    _max_n = int(self.config.get("max_n", 3))
+                else:
+                    try:
+                        _max_n = int(max_n)
+                    except (TypeError, ValueError):
+                        raise ValueError("max_n must be an int in [2, 10]")
+                    if not 2 <= _max_n <= 10:
+                        raise ValueError("max_n must be an int in [2, 10]")
+                seqs = find_frequent_sequences(labels, _max_n, min_sup) or []
             except Exception:
                 seqs = []
         if not seqs and len(labels) > 1:
@@ -1179,29 +1189,41 @@ class Nexora:
                 "ids": [p.get("id") for p in pats if isinstance(p, dict)],
                 "status": _status, "status_reason": _sreason}
 
-    def match(self, observation: Any) -> list:
-        """Rank all stored patterns by similarity to one observation."""
+    def match(self, observation: Any, threshold: float | None = None) -> list:
+        """Rank all stored patterns by similarity to one observation.
+
+        threshold (I91): per-call match floor in [0, 1]; None (default)
+        uses 0.5. Each entry's "threshold" cites the value used.
+        """
+        try:
+            thr = _MATCH_THRESHOLD if threshold is None else float(threshold)
+        except (TypeError, ValueError):
+            raise ValueError("threshold must be a number in [0, 1]")
+        if not 0.0 <= thr <= 1.0:
+            raise ValueError("threshold must be a number in [0, 1]")
         row = _rows([observation])[0]
         res = []
         for p in self.repo.all():
             s = _sim(row, p)
-            m = s >= _MATCH_THRESHOLD
+            m = s >= thr
             feats = _overlap_features(row, p)
-            ev = explain_match(row, p.get("id"), s, feats, m, _MATCH_THRESHOLD) if explain_match else "similarity %.3f" % s
-            res.append({"pattern_id": p.get("id"), "similarity": s, "matched": m, "evidence": ev, "explanation": ev})
+            ev = explain_match(row, p.get("id"), s, feats, m, thr) if explain_match else "similarity %.3f" % s
+            res.append({"pattern_id": p.get("id"), "similarity": s, "matched": m,
+                        "threshold": thr, "evidence": ev, "explanation": ev})
         res.sort(key=lambda d: (-d["similarity"], str(d["pattern_id"])))
         return res
 
-    def match_top(self, observation: Any) -> dict:
+    def match_top(self, observation: Any, threshold: float | None = None) -> dict:
         """Best single match for one observation (I14).
 
         match() returns the full ranking (kept for compatibility);
         match_top() answers "what is this most like?" with one status
         envelope: {"pattern_id", "similarity", "matched", "explanation",
         "ranked" (total compared), "status", ...}. NONE when nothing is
-        stored or nothing reaches the threshold.
+        stored or nothing reaches the threshold (I91: per-call
+        threshold, None uses 0.5).
         """
-        ranked = self.match(observation)
+        ranked = self.match(observation, threshold=threshold)
         if not ranked:
             _r = "NONE: no patterns stored; run discover() first."
             return {"pattern_id": None, "similarity": 0.0, "matched": False,
@@ -1218,7 +1240,8 @@ class Nexora:
                     "status_reason": "FOUND: best of %d (sim=%.3f)." % (
                         len(ranked), best.get("similarity", 0.0))}
         _r = ("NONE: best of %d below threshold %.2f (sim=%.3f)."
-              % (len(ranked), _MATCH_THRESHOLD, best.get("similarity", 0.0)))
+              % (len(ranked), ranked[0].get("threshold", _MATCH_THRESHOLD),
+                 best.get("similarity", 0.0)))
         return {"pattern_id": best.get("pattern_id"),
                 "similarity": best.get("similarity", 0.0),
                 "matched": False, "ranked": len(ranked),
@@ -1250,14 +1273,25 @@ class Nexora:
         return out
 
     def find_anomalies(self, data: Any, min_severity: str | None = None,
-                       z_threshold: float | None = None) -> dict:
+                       z_threshold: float | None = None,
+                       robust_window: int | None = None) -> dict:
         """Flag statistical outliers + novel/missing sequence transitions.
 
         min_severity (I13): keep only records at/above this level
         ("low" < "medium" < "high" < "critical"); None keeps all.
         Unknown levels raise ValueError naming the four.
         z_threshold (I38): per-call z floor; None uses the config value.
+        robust_window (I93): per-call rolling window (int >= 1); None uses config.
         """
+        if robust_window is not None:
+            try:
+                _rw_ov = int(robust_window)
+            except (TypeError, ValueError):
+                raise ValueError("robust_window must be an int >= 1")
+            if _rw_ov is True or _rw_ov < 1:
+                raise ValueError("robust_window must be an int >= 1")
+        else:
+            _rw_ov = None
         rows = _rows(data)
         st = _stats([r["value"] for r in rows])
         if z_threshold is None:
@@ -1371,10 +1405,7 @@ class Nexora:
                         _per = _best[1]
                 except Exception:
                     _per = None
-                try:
-                    _rw = max(1, int(self.config.get("robust_window", 20)))
-                except (TypeError, ValueError):
-                    _rw = 20
+                _rw = _rw_ov if _rw_ov is not None else max(1, int(self.config.get("robust_window", 20)))
                 try:
                     _rt = float(self.config.get("robust_threshold", 3.5))
                 except (TypeError, ValueError):
@@ -1419,7 +1450,8 @@ class Nexora:
         return {"anomalies": out, "count": len(out), "reason": expl, "explanation": expl,
                 "evidence": {"stats": st}, "status": _status, "status_reason": _sreason}
 
-    def predict(self, data: Any, current: Any = None, top_k: int = 3) -> dict:
+    def predict(self, data: Any, current: Any = None, top_k: int = 3,
+                order: int | None = None) -> dict:
         """P(next|current) from bigram counts + backoff context model.
 
         predictions: first-order Markov (stable v0.1 field). context:
@@ -1427,6 +1459,7 @@ class Nexora:
         log_loss: mean base-2 NLL of the data under the context model
         (lower = more predictable; None when not computable).
         top_k (I39): candidates per field; None uses 3.
+        order (I94): context backoff ceiling (int 0..10); None uses config.
         """
         labels = [r["label"] for r in _rows(data)]
         try:
@@ -1474,6 +1507,15 @@ class Nexora:
             raise ValueError("top_k must be an int >= 1")
         if _tk is True or _tk < 1:  # bool is not a valid top_k
             raise ValueError("top_k must be an int >= 1")
+        if order is None:
+            _mo_ov = None
+        else:
+            try:
+                _mo_ov = int(order)
+            except (TypeError, ValueError):
+                raise ValueError("order must be an int in [0, 10]")
+            if _mo_ov is True or not 0 <= _mo_ov <= 10:
+                raise ValueError("order must be an int in [0, 10]")
         if build_transition_matrix is not None:
             self._matrix = build_transition_matrix(mlabels)
             cur = current if current is not None else (mlabels[-1] if mlabels else None)
@@ -1484,7 +1526,7 @@ class Nexora:
         _ctx_from, _ctx_query = "tail", []
         if build_context_model is not None and labels:
             try:
-                mo = max(0, int(self.config.get("context_order", 2)))
+                mo = _mo_ov if _mo_ov is not None else max(0, int(self.config.get("context_order", 2)))
                 clean = [_l for _l in labels if _keep_lab(_l)]
                 self._ctx = build_context_model(clean, mo)
                 tail = clean[-mo:] if mo > 0 else []
@@ -2575,8 +2617,11 @@ class Nexora:
                 "reason": _r, "explanation": _r,
                 "status": STATUS_NONE, "status_reason": _r}
 
-    def regimes(self, data: Any) -> dict:
-        """Clustered level-regimes of numeric data (I17)."""
+    def regimes(self, data: Any, size: int | None = None, k: int | None = None) -> dict:
+        """Clustered level-regimes of numeric data (I17).
+
+        size/k (I95): per-call window and cluster count; None uses config.
+        """
         if find_regimes is None:
             raise ImportError("nexora.discovery.clustering is required")
         vals = self._numeric_values(_rows(data))
@@ -2587,10 +2632,12 @@ class Nexora:
                     "explanation": _r, "status": STATUS_INSUFFICIENT,
                     "status_reason": _r}
         try:
-            size = max(2, int(self.config.get("regime_size", 8)))
-            k = max(2, int(self.config.get("n_clusters", 2)))
+            size = max(2, int(self.config.get("regime_size", 8))) if size is None else int(size)
+            k = max(2, int(self.config.get("n_clusters", 2))) if k is None else int(k)
         except (TypeError, ValueError):
-            size, k = 8, 2
+            raise ValueError("size and k must be ints >= 2") from None
+        if size is True or k is True or size < 2 or k < 2:
+            raise ValueError("size and k must be ints >= 2")
         try:
             found = find_regimes(vals, size=size, k=k) or []
         except Exception:
