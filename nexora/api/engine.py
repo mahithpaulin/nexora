@@ -1944,7 +1944,8 @@ class Nexora:
                 "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
 
     def reset(self) -> dict:
-        """Clear memory, trails and stream state (I11). Config is kept."""        if PatternRepository is None:
+        """Clear memory, trails and stream state (I11). Config is kept."""
+        if PatternRepository is None:
             raise ImportError("nexora.memory.repository is required")
         self.repo = PatternRepository()
         self._trail = {}
