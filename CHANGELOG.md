@@ -6,7 +6,7 @@ Loop 2 (I51-I100, branch `v3`, PR #3). API still unchanged — all
 additive. Explanation batch: explain() over result lists,
 report_patterns dossier, anomaly_report, coverage, sampling cadence.
 Prediction depth: forecast, walk-forward backtest, surprises (top-NLL
-positions), markov_table, vocabulary. Streaming: update elapsed timing,
+positions), markov_table, vocabulary. Streaming: update window_full flag,
 stream_describe, replay, JSON-safe stream_checkpoint/restore (stream
 state is no longer session-only). Discovery: motifs, rules,
 centrality, entropy, stationarity. Preprocessing: validate, dedupe,

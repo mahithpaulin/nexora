@@ -6,9 +6,9 @@ import pytest
 from nexora.api.engine import Nexora
 
 
-def test_update_elapsed():
-    out = Nexora().update([1.0, 2.0, 3.0])
-    assert out["elapsed"] >= 0.0
+def test_update_window_full():
+    assert Nexora().update([1.0, 2.0, 3.0])["window_full"] is False
+    assert Nexora().update([1.0] * 30)["window_full"] is True
 
 
 def test_stream_describe():

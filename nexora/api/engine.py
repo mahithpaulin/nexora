@@ -1947,8 +1947,6 @@ class Nexora:
                 _r["index"] = _base + _k
             except Exception:
                 pass
-        import time as _time
-        _t0 = _time.perf_counter()
         new_changes = []
         for r in rows:
             v = r.get("value")
@@ -2034,8 +2032,9 @@ class Nexora:
         return {"processed": len(rows), "total": self._stream_n, "stats": _s,
                 "window": _w, "changes": new_changes,
                 "changes_total": len(self._stream_changes),
-                # I61: wall seconds spent folding this chunk.
-                "elapsed": _time.perf_counter() - _t0,
+                # I61: trailing window at capacity (change detector fully armed).
+                "window_full": bool(self._stream_window is not None
+                                    and self._stream_window.n >= wsize),
                 "reason": ("Streamed %d observation(s), %d total; %d new change(s), %d retained."
                            % (len(rows), self._stream_n, len(new_changes),
                               len(self._stream_changes))),
