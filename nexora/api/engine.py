@@ -3742,3 +3742,165 @@ class Nexora:
                 "z": (None if z == float("inf") else z),
                 "reason": _r, "explanation": _r,
                 "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    # ---- v3 loop 2, batch N: preprocessing helpers. ----
+
+    def validate(self, data: Any) -> dict:
+        """Row shape + junk census for any input (I71)."""
+        try:
+            rows = _rows(data)
+        except Exception as exc:
+            _r = "Invalid input: %s" % exc
+            return {"valid": False, "n": 0, "issues": [_r], "reason": _r,
+                    "explanation": _r, "status": STATUS_INSUFFICIENT,
+                    "status_reason": "INSUFFICIENT_DATA: " + _r}
+        issues = []
+        junk = 0
+        for i, r in enumerate(rows):
+            try:
+                v = r.get("value")
+            except Exception:
+                junk += 1
+                issues.append("row %d unreadable" % i)
+                continue
+            if v is None or (isinstance(v, float) and v != v):
+                junk += 1
+        if junk:
+            issues.append("%d/%d missing values" % (junk, len(rows)))
+        if not rows:
+            issues.append("empty input")
+        ok = bool(rows)
+        _r = "%d row(s), %d junk." % (len(rows), junk) if ok else "No valid rows."
+        return {"valid": ok, "n": len(rows), "junk": junk, "issues": issues[:10],
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND if ok else STATUS_INSUFFICIENT,
+                "status_reason": ("FOUND: " + _r if ok else "INSUFFICIENT_DATA: " + _r)}
+
+    def dedupe(self, data: Any) -> dict:
+        """Drop consecutive duplicates, keep firsts (I72)."""
+        rows = _rows(data)
+        keep, dropped = [], 0
+        prev_unset, prev = True, None
+        for r in rows:
+            try:
+                key = (r.get("value"), r.get("label"))
+            except Exception:
+                key = (None, None)
+            if not prev_unset and key == prev:
+                dropped += 1
+                continue
+            prev, prev_unset = key, False
+            keep.append(r.get("raw", r.get("value")))
+        _r = "Kept %d of %d (%d consecutive duplicates dropped)." % (
+            len(keep), len(rows), dropped)
+        return {"data": keep, "kept": len(keep), "dropped": dropped,
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND if keep else STATUS_NONE,
+                "status_reason": ("FOUND: " + _r if keep else "NONE: empty result.")}
+
+    def clip(self, data: Any, lo: float | None = None,
+             hi: float | None = None) -> dict:
+        """Winsorize numerics into [lo, hi] (I73)."""
+        if lo is not None and hi is not None and lo > hi:
+            raise ValueError("lo must be <= hi")
+        rows = _rows(data)
+        out, clipped = [], 0
+        for r in rows:
+            try:
+                v = r.get("value")
+            except Exception:
+                out.append(None)
+                continue
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v:
+                out.append(r.get("raw", v))
+                continue
+            f = float(v)
+            c = (lo if (lo is not None and f < lo) else
+                 hi if (hi is not None and f > hi) else f)
+            if c != f:
+                clipped += 1
+            out.append(c)
+        _r = "Clipped %d of %d value(s)%s." % (
+            clipped, len(out),
+            (" to [%.4g, %.4g]" % (lo, hi)) if lo is not None or hi is not None else "")
+        return {"data": out, "clipped": clipped, "n": len(out),
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND if out else STATUS_NONE,
+                "status_reason": ("FOUND: " + _r if out else "NONE: empty input.")}
+
+    def fill_missing(self, data: Any, method: str = "ffill") -> dict:
+        """Fill None/NaN values: ffill (default) or mean (I74)."""
+        if method not in ("ffill", "mean"):
+            raise ValueError("method must be 'ffill' or 'mean', got %r" % (method,))
+        rows = _rows(data)
+        raw = []
+        for r in rows:
+            try:
+                v = r.get("value")
+            except Exception:
+                v = None
+            raw.append(None if (v is None or (isinstance(v, float) and v != v)) else v)
+        filled = 0
+        if method == "mean":
+            nums = [float(v) for v in raw
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)]
+            import statistics as _st
+            m = _st.fmean(nums) if nums else 0.0
+            out = []
+            for v in raw:
+                if v is None:
+                    out.append(m)
+                    filled += 1
+                else:
+                    out.append(v)
+        else:
+            out, last = [], None
+            for v in raw:
+                if v is None:
+                    if last is None:
+                        out.append(None)
+                    else:
+                        out.append(last)
+                        filled += 1
+                else:
+                    last = v
+                    out.append(v)
+        _r = "Filled %d of %d with %s." % (filled, len(raw), method)
+        return {"data": out, "filled": filled, "n": len(out),
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND if out else STATUS_NONE,
+                "status_reason": ("FOUND: " + _r if out else "NONE: empty input.")}
+
+    def outliers_iqr(self, data: Any, k: float = 1.5) -> dict:
+        """Tukey IQR-fence outlier indices (I75)."""
+        try:
+            k = float(k)
+            if not k > 0:
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise ValueError("k must be a number > 0")
+        rows = _rows(data)
+        vals = [(i, float(r.get("value"))) for i, r in enumerate(rows)
+                if isinstance(r.get("value"), (int, float))
+                and not isinstance(r.get("value"), bool)
+                and r.get("value") == r.get("value")]
+        if len(vals) < 4:
+            _r = "INSUFFICIENT_DATA: need >= 4 numerics, got %d." % len(vals)
+            return {"indices": [], "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        import statistics as _st
+        ordered = sorted(v for _, v in vals)
+        q1 = _st.median(ordered[:len(ordered) // 2])
+        q3 = _st.median(ordered[(len(ordered) + 1) // 2:])
+        iqr = q3 - q1
+        lo, hi = q1 - k * iqr, q3 + k * iqr
+        hits = [{"index": i, "value": v} for i, v in vals if v < lo or v > hi]
+        if hits:
+            _r = "%d IQR outlier(s) outside [%.4g, %.4g]." % (len(hits), lo, hi)
+            return {"indices": [h["index"] for h in hits], "points": hits,
+                    "fences": [lo, hi], "reason": _r, "explanation": _r,
+                    "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+        _r = "No outliers inside [%.4g, %.4g]." % (lo, hi)
+        return {"indices": [], "points": [], "fences": [lo, hi],
+                "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": "NONE: " + _r}
