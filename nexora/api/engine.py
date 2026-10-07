@@ -4366,3 +4366,92 @@ class Nexora:
                 "reason": "%d anomalie(s) in %d kind(s)." % (found.get("count", 0), len(cnt)),
                 "status": found.get("status", STATUS_NONE),
                 "status_reason": found.get("status_reason", "")}
+
+    # ---- v3 loop 2, final batch S. ----
+
+    def periodogram(self, data: Any, max_lag: int = 20) -> dict:
+        """Autocorrelation table + best lag (I96)."""
+        a = self.autocorr(data, max_lag=max_lag)
+        if a["status"] != STATUS_FOUND or not a.get("lags"):
+            _r = "NONE: no lags computable."
+            return {"lags": {}, "best_lag": None, "reason": _r,
+                    "explanation": _r, "status": a["status"],
+                    "status_reason": a.get("status_reason", _r)}
+        lags = a["lags"]
+        best = max(lags.items(), key=lambda kv: (abs(kv[1]), -kv[0]))
+        _r = "Best lag %d (|r|=%.3f)." % (best[0], abs(best[1]))
+        return {"lags": lags, "best_lag": int(best[0]), "best_r": float(best[1]),
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    def bars(self, data: Any, width: int = 40) -> dict:
+        """ASCII sparkline of numeric values (I97)."""
+        try:
+            width = max(1, int(width))
+        except (TypeError, ValueError):
+            width = 40
+        vals = self._numeric_values(_rows(data))
+        if not vals:
+            _r = "INSUFFICIENT_DATA: no numeric values."
+            return {"spark": "", "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        glyphs = " .:-=+*#%@"
+        lo, hi = min(vals), max(vals)
+        span = (hi - lo) or 1.0
+        spark = "".join(glyphs[min(len(glyphs) - 1,
+                                   int((v - lo) / span * (len(glyphs) - 1)))] for v in vals)
+        if len(spark) > width:
+            step = len(spark) / width
+            spark = "".join(spark[int(i * step)] for i in range(width))
+        _r = "Sparkline of %d value(s)." % len(vals)
+        return {"spark": spark, "min": lo, "max": hi,
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    def records(self, data: Any) -> dict:
+        """JSON-safe observation rows (raw payloads stringified) (I98)."""
+        rows = _rows(data)
+        out = []
+        for r in rows:
+            try:
+                out.append({"index": r.get("index"), "value": r.get("value"),
+                            "label": r.get("label"), "timestamp": r.get("timestamp"),
+                            "raw": str(r.get("raw"))})
+            except Exception:
+                continue
+        try:
+            import json as _js
+            _js.dumps(out, default=str)
+        except Exception:
+            out = [{"index": i, "value": None, "label": None,
+                    "timestamp": None, "raw": ""} for i in range(len(out))]
+        if out:
+            return {"records": out, "count": len(out),
+                    "reason": "%d record(s)." % len(out),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: records ready."}
+        _r = "NONE: no observations."
+        return {"records": [], "count": 0, "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
+
+    def jaccard(self, a: Any, b: Any) -> dict:
+        """Label-set Jaccard similarity, 0..1 (I99)."""
+        sa = {r.get("label") for r in _rows(a)
+              if r.get("label") is not None and r.get("label") == r.get("label")}
+        sb = {r.get("label") for r in _rows(b)
+              if r.get("label") is not None and r.get("label") == r.get("label")}
+        try:
+            sa = {str(x) for x in sa}
+            sb = {str(x) for x in sb}
+        except Exception:
+            pass
+        if not sa and not sb:
+            _r = "INSUFFICIENT_DATA: no labels on either side."
+            return {"jaccard": None, "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        inter, union = len(sa & sb), len(sa | sb)
+        j = (inter / union) if union else 0.0
+        _r = "Jaccard %.3f (%d shared of %d)." % (j, inter, union)
+        return {"jaccard": j, "shared": inter, "union": union,
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
