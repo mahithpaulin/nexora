@@ -1,6 +1,22 @@
 # Changelog
 
-## 3.0.0
+## 3.1.0
+
+Loop 2 (I51-I100, branch `v3`, PR #3). API still unchanged — all
+additive. Explanation batch: explain() over result lists,
+report_patterns dossier, anomaly_report, coverage, sampling cadence.
+Prediction depth: forecast, walk-forward backtest, surprises (top-NLL
+positions), markov_table, vocabulary. Streaming: update elapsed timing,
+stream_describe, replay, JSON-safe stream_checkpoint/restore (stream
+state is no longer session-only). Discovery: motifs, rules,
+centrality, entropy, stationarity. Preprocessing: validate, dedupe,
+clip, fill_missing, Tukey outliers_iqr. Sharing: snapshot/restore,
+share/adopt, signature-aware merge (fresh ids, foreign occurrences
+dropped). Simulation: seeded simulate, sequence_prob, predict_proba,
+L1 divergence, seasonal_forecast. Polish: len/in/iter/repr, api()
+catalog, limits() table, anomaly_kinds, per-call threshold/max_n/
+robust_window/order/size-k overrides (validated fail-fast, never
+swallowed), periodogram, ASCII bars, JSON-safe records, jaccard.
 
 50-iteration clarity + capability loop on top of 2.0.0 (branch `v3`,
 PR #3). Public API unchanged: everything is additive or strictly
