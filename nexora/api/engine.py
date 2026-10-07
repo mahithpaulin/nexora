@@ -2218,3 +2218,229 @@ class Nexora:
         return {"kind": "unknown", "params": {}, "next": [],
                 "confidence": 0.0, "reason": _r, "explanation": _r,
                 "status": STATUS_NONE, "status_reason": _r}
+
+    # ---- v3 analysis wrappers (batch C): additive read-only views. ----
+
+    def _numeric_values(self, rows):
+        """float list of numeric row values (bool/NaN excluded)."""
+        out = []
+        for r in rows:
+            try:
+                v = r.get("value")
+            except Exception:
+                continue
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            if v != v:
+                continue
+            out.append(float(v))
+        return out
+
+    def seasonality(self, data: Any) -> dict:
+        """Dominant period + strength for numeric data (I15)."""
+        if estimate_period is None or decompose is None:
+            raise ImportError("nexora.features.seasonality is required")
+        vals = self._numeric_values(_rows(data))
+        if len(vals) < 6:
+            _r = ("INSUFFICIENT_DATA: need >= 6 numeric values, got %d."
+                  % len(vals))
+            return {"period": None, "strength": 0.0, "reason": _r,
+                    "explanation": _r, "status": STATUS_INSUFFICIENT,
+                    "status_reason": _r}
+        try:
+            mp = min(max(2, len(vals) // 2),
+                     max(2, int(self.config.get("max_period", 256))))
+        except (TypeError, ValueError):
+            mp = min(max(2, len(vals) // 2), 256)
+        try:
+            est = estimate_period(vals, max_period=mp)
+        except TypeError:
+            est = estimate_period(vals)
+        except Exception:
+            est = {"period": None, "strength": 0.0}
+        per = (est or {}).get("period")
+        if per:
+            try:
+                dec = decompose(vals, int(per))
+            except Exception:
+                dec = {}
+            return {"period": int(per), "strength": float((est or {}).get("strength", 0.0)),
+                    "seasonal_strength": (dec or {}).get("seasonal_strength", 0.0),
+                    "trend_strength": (dec or {}).get("trend_strength", 0.0),
+                    "reason": "Period %d (strength %.3f)." % (per, (est or {}).get("strength", 0.0)),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: period %d." % per}
+        _r = "NONE: no dominant period (strength %.3f)." % float((est or {}).get("strength", 0.0))
+        return {"period": None, "strength": float((est or {}).get("strength", 0.0)),
+                "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
+
+    def correlation(self, data: Any) -> dict:
+        """Pairwise numeric-column correlations (I16).
+
+        Needs >= 2 numeric columns (dict rows); otherwise
+        INSUFFICIENT_DATA with the column count cited.
+        """
+        if find_correlation_patterns is None:
+            raise ImportError("nexora.features.correlation is required")
+        rows = _rows(data)
+        raws = [r.get("raw") for r in rows if isinstance(r.get("raw"), dict)]
+        cols = _numeric_columns(raws)
+        if len(cols) < 2:
+            _r = ("INSUFFICIENT_DATA: need >= 2 numeric columns, found %d."
+                  % len(cols))
+            return {"pairs": [], "count": 0, "columns": sorted(cols),
+                    "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        try:
+            thr = float(self.config.get("corr_threshold", 0.7))
+        except (TypeError, ValueError):
+            thr = 0.7
+        try:
+            pats = find_correlation_patterns(cols, threshold=thr) or []
+        except Exception:
+            pats = []
+        pairs = []
+        for cp in pats:
+            try:
+                feats = cp.get("features", {}) or {}
+                pairs.append({"a": feats.get("a"), "b": feats.get("b"),
+                              "r": feats.get("r"), "strength": feats.get("strength"),
+                              "n": feats.get("n")})
+            except Exception:
+                continue
+        if pairs:
+            return {"pairs": pairs, "count": len(pairs), "columns": sorted(cols),
+                    "reason": "%d correlated pair(s) at |r|>=%.2f." % (len(pairs), thr),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: %d pair(s)." % len(pairs)}
+        _r = "NONE: no pairs at |r|>=%.2f over %d column(s)." % (thr, len(cols))
+        return {"pairs": [], "count": 0, "columns": sorted(cols),
+                "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
+
+    def regimes(self, data: Any) -> dict:
+        """Clustered level-regimes of numeric data (I17)."""
+        if find_regimes is None:
+            raise ImportError("nexora.discovery.clustering is required")
+        vals = self._numeric_values(_rows(data))
+        if len(vals) < 16:
+            _r = ("INSUFFICIENT_DATA: need >= 16 numeric values, got %d."
+                  % len(vals))
+            return {"regimes": [], "count": 0, "reason": _r,
+                    "explanation": _r, "status": STATUS_INSUFFICIENT,
+                    "status_reason": _r}
+        try:
+            size = max(2, int(self.config.get("regime_size", 8)))
+            k = max(2, int(self.config.get("n_clusters", 2)))
+        except (TypeError, ValueError):
+            size, k = 8, 2
+        try:
+            found = find_regimes(vals, size=size, k=k) or []
+        except Exception:
+            found = []
+        if found:
+            return {"regimes": found, "count": len(found),
+                    "reason": "%d regime(s), k=%d, window=%d." % (len(found), k, size),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: %d regime(s)." % len(found)}
+        _r = "NONE: no regimes (k=%d, window=%d)." % (k, size)
+        return {"regimes": [], "count": 0, "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
+
+    def change_points(self, data: Any) -> dict:
+        """Level/step change points, numeric + label views (I18)."""
+        try:
+            from nexora.discovery.change_points import change_points as _cp
+            from nexora.discovery.change_points import label_change_points as _lcp
+        except ImportError:
+            _cp = _lcp = None
+        if _cp is None:
+            raise ImportError("nexora.discovery.change_points is required")
+        rows = _rows(data)
+        vals = self._numeric_values(rows)
+        labels = [r.get("label") for r in rows]
+        pts, lab_pts = [], []
+        if len(vals) >= 6:
+            try:
+                _w = max(2, int(self.config.get("ls_window", 10)))
+            except (TypeError, ValueError):
+                _w = 10
+            try:
+                pts = _cp(vals, window=_w) or []
+            except Exception:
+                pts = []
+        if _lcp is not None and len(labels) >= 3:
+            try:
+                lab_pts = _lcp(labels) or []
+            except Exception:
+                lab_pts = []
+        if pts or lab_pts:
+            return {"points": pts, "label_points": lab_pts,
+                    "count": len(pts) + len(lab_pts),
+                    "reason": "%d numeric + %d label change point(s)."
+                              % (len(pts), len(lab_pts)),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: %d change point(s)."
+                                     % (len(pts) + len(lab_pts))}
+        _r = "NONE: no change points in %d observation(s)." % len(rows)
+        return {"points": [], "label_points": [], "count": 0,
+                "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
+
+    def frequencies(self, data: Any, top_k: int = 10) -> dict:
+        """Value-count table for any iterable (I19)."""
+        try:
+            top_k = max(1, int(top_k))
+        except (TypeError, ValueError):
+            top_k = 10
+        rows = _rows(data)
+        cnt = collections.Counter()
+        for r in rows:
+            try:
+                v = r.get("value")
+                key = str(v) if not isinstance(v, str) else v
+            except Exception:
+                continue
+            if v is None or v != v:
+                continue
+            cnt[key] += 1
+        total = sum(cnt.values())
+        table = [{"value": k, "count": c,
+                  "fraction": (c / total) if total else 0.0}
+                 for k, c in cnt.most_common(top_k)]
+        if table:
+            return {"frequencies": table, "distinct": len(cnt), "n": total,
+                    "reason": "%d distinct value(s) in %d observation(s)."
+                              % (len(cnt), total),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: %d distinct value(s)." % len(cnt)}
+        _r = "NONE: no countable values."
+        return {"frequencies": [], "distinct": 0, "n": 0,
+                "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
+
+    def transitions(self, data: Any, top_k: int = 10) -> dict:
+        """Bigram transition table with probabilities (I19)."""
+        try:
+            top_k = max(1, int(top_k))
+        except (TypeError, ValueError):
+            top_k = 10
+        labels = [r.get("label") for r in _rows(data)
+                  if r.get("label") is not None and r.get("label") == r.get("label")]
+        pairs = collections.Counter(zip(labels, labels[1:]))
+        totals = collections.Counter()
+        for (a, _b), c in pairs.items():
+            totals[a] += c
+        table = [{"from": a, "to": b, "count": c,
+                  "probability": (c / totals[a]) if totals[a] else 0.0}
+                 for (a, b), c in pairs.most_common(top_k)]
+        if table:
+            return {"transitions": table, "distinct": len(pairs),
+                    "reason": "%d distinct transition(s)." % len(pairs),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: %d transition(s)." % len(pairs)}
+        _r = "NONE: no transitions (need >= 2 labels)."
+        return {"transitions": [], "distinct": 0,
+                "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
