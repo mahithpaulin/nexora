@@ -4230,3 +4230,91 @@ class Nexora:
         return {"steps": nxt, "period": pp,
                 "reason": _r, "explanation": _r,
                 "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    # ---- v3 loop 2, batch Q: pythonic surface + introspection. ----
+
+    def __len__(self) -> int:
+        """Stored pattern count (I86): len(nx)."""
+        try:
+            return self.repo.size()
+        except Exception:
+            return 0
+
+    def __contains__(self, pid: object) -> bool:
+        """Membership by pattern id (I86): "P-001" in nx."""
+        try:
+            return any(str(p.get("id")) == str(pid) for p in self.repo.all()
+                       if isinstance(p, dict))
+        except Exception:
+            return False
+
+    def __iter__(self):
+        """Iterate stored pattern dicts (I86)."""
+        try:
+            return iter([p for p in self.repo.all() if isinstance(p, dict)])
+        except Exception:
+            return iter([])
+
+    def __repr__(self) -> str:
+        """Compact state line (I87)."""
+        try:
+            np_ = self.repo.size()
+        except Exception:
+            np_ = 0
+        return "Nexora(patterns=%d, streamed=%d)" % (np_, self._stream_n)
+
+    def api(self) -> dict:
+        """Catalog of public methods with one-line docs (I88)."""
+        out = {}
+        for name in sorted(dir(self)):
+            if name.startswith("_"):
+                continue
+            try:
+                fn = getattr(self, name)
+                if not callable(fn):
+                    continue
+                doc = (fn.__doc__ or "").strip().splitlines()
+                out[name] = doc[0] if doc else ""
+            except Exception:
+                continue
+        return {"methods": out, "count": len(out),
+                "reason": "%d public method(s)." % len(out),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: api catalog ready."}
+
+    def limits(self) -> dict:
+        """Machine-readable capability + threshold table (I89)."""
+        def _flag(mod):
+            return mod is not None
+        cfg = dict(self.config)
+        out = {
+            "min_data": {k: cfg.get(k) for k in
+                         ("min_data_discover", "min_data_anomalies", "min_data_predict")},
+            "gates": {"abstain_threshold": cfg.get("abstain_threshold"),
+                      "min_evidence": cfg.get("min_evidence"),
+                      "match_threshold": _MATCH_THRESHOLD},
+            "capabilities": {
+                "regimes": _flag(find_regimes), "correlation": _flag(find_correlation_patterns),
+                "seasonality": _flag(estimate_period), "context": _flag(build_context_model),
+                "multivariate": _flag(detect_multivariate), "robust": _flag(_robust_detect),
+                "arithmetic": _flag(_analyze_seq), "structural": _flag(_co_graph),
+                "dtw": _flag(dtw_distance), "pca": _flag(_pca),
+            },
+        }
+        return {"limits": out, "reason": "Limits table ready.",
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: limits ready."}
+
+    def anomaly_kinds(self, data: Any) -> dict:
+        """Anomaly counts grouped by kind (I90)."""
+        found = self.find_anomalies(data)
+        cnt = collections.Counter()
+        for a in (found.get("anomalies", []) or []):
+            try:
+                cnt[str(a.get("kind", "unknown"))] += 1
+            except Exception:
+                continue
+        return {"kinds": dict(cnt), "count": found.get("count", 0),
+                "reason": "%d anomalie(s) in %d kind(s)." % (found.get("count", 0), len(cnt)),
+                "status": found.get("status", STATUS_NONE),
+                "status_reason": found.get("status_reason", "")}
