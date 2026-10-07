@@ -2945,3 +2945,132 @@ class Nexora:
         return {"nodes": 0, "edges": 0, "components": 0, "top_edges": [],
                 "reason": _r, "explanation": _r,
                 "status": STATUS_NONE, "status_reason": _r}
+
+    # ---- v3 distances + shapes (final batch I). ----
+
+    def dtw(self, a: Any, b: Any, window: int | None = None) -> dict:
+        """DTW distance/similarity between two numeric series (I45)."""
+        if dtw_distance is None:
+            raise ImportError("nexora.matching.dtw is required")
+        va = self._numeric_values(_rows(a))
+        vb = self._numeric_values(_rows(b))
+        if not va or not vb:
+            _r = "INSUFFICIENT_DATA: two non-empty numeric series required."
+            return {"distance": None, "similarity": 0.0, "reason": _r,
+                    "explanation": _r, "status": STATUS_INSUFFICIENT,
+                    "status_reason": _r}
+        try:
+            dist, _path, sim = dtw_distance(va, vb, window=window)
+        except Exception as exc:
+            raise ValueError("dtw failed: %s" % exc)
+        _r = "DTW distance %.4g, similarity %.3f." % (dist, sim)
+        return {"distance": float(dist), "similarity": float(sim),
+                "n": len(va), "m": len(vb),
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    def align(self, a: Any, b: Any, max_lag: int = 10) -> dict:
+        """Best-lag cross-correlation between two series (I46).
+
+        Returns the lag with max |r| and its sign/strength — "b follows
+        a by k" when lag k wins positive.
+        """
+        try:
+            from nexora.features.correlation import cross_correlation as _xc
+        except ImportError:
+            _xc = None
+        if _xc is None:
+            raise ImportError("nexora.features.correlation is required")
+        try:
+            max_lag = max(0, int(max_lag))
+        except (TypeError, ValueError):
+            max_lag = 10
+        va = self._numeric_values(_rows(a))
+        vb = self._numeric_values(_rows(b))
+        if len(va) < 2 or len(vb) < 2:
+            _r = "INSUFFICIENT_DATA: two series of >= 2 numerics required."
+            return {"lag": None, "r": 0.0, "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        try:
+            table = _xc(va, vb, max_lag=max_lag) or {}
+        except Exception as exc:
+            raise ValueError("align failed: %s" % exc)
+        best = max(table.items(), key=lambda kv: (abs(kv[1]), kv[0])) if table else (0, 0.0)
+        lag, r = int(best[0]), float(best[1])
+        _r = "Best lag %d (r=%.3f)." % (lag, r)
+        return {"lag": lag, "r": r, "lags": {int(k): float(v) for k, v in table.items()},
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    def reduce(self, data: Any, size: int = 8, n_components: int = 2) -> dict:
+        """PCA over windowed embeddings of a numeric series (I47)."""
+        if _pca is None or _embed_windows is None:
+            raise ImportError("nexora.features.pca / discovery.clustering is required")
+        try:
+            size, n_components = int(size), int(n_components)
+        except (TypeError, ValueError):
+            raise ValueError("size must be >= 2 and n_components >= 1")
+        if size is True or n_components is True or size < 2 or n_components < 1:
+            raise ValueError("size must be >= 2 and n_components >= 1")
+        vals = self._numeric_values(_rows(data))
+        if len(vals) < 2 * size:
+            _r = ("INSUFFICIENT_DATA: need >= %d numerics, got %d."
+                  % (2 * size, len(vals)))
+            return {"components": [], "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        try:
+            vecs, _starts = _embed_windows(vals, size)
+            res = _pca(vecs, n_components=min(n_components, size)) or {}
+        except Exception as exc:
+            raise ValueError("reduce failed: %s" % exc)
+        if not isinstance(res, dict) or not res.get("components"):
+            _r = "NONE: PCA yielded no components."
+            return {"components": [], "reason": _r, "explanation": _r,
+                    "status": STATUS_NONE, "status_reason": _r}
+        return {"components": res.get("components"),
+                "explained_ratio": res.get("explained_ratio", []),
+                "reason": res.get("reason", "PCA computed."),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: PCA computed."}
+
+    def discretize(self, data: Any, bins: int = 4) -> dict:
+        """Bin numeric values into labeled ranges (I49).
+
+        Returns {"labels", "edges", ...} — feed labels back into
+        transitions()/predict() for categorical mining of numeric data.
+        """
+        try:
+            bins = max(2, int(bins))
+        except (TypeError, ValueError):
+            bins = 4
+        rows = _rows(data)
+        vals = self._numeric_values(rows)
+        if not vals:
+            _r = "INSUFFICIENT_DATA: no numeric values to bin."
+            return {"labels": [], "edges": [], "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        lo, hi = min(vals), max(vals)
+        if hi == lo:
+            lab = ["bin0"] * len(vals)
+            return {"labels": lab, "edges": [lo, hi], "bins": 1,
+                    "reason": "Constant data: single bin.",
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: single bin."}
+        width = (hi - lo) / bins
+        edges = [lo + i * width for i in range(bins + 1)]
+        out = []
+        for r in rows:
+            try:
+                v = r.get("value")
+            except Exception:
+                out.append(None)
+                continue
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v:
+                out.append(None)
+                continue
+            idx = min(bins - 1, int((float(v) - lo) / width))
+            out.append("bin%d[%.3g-%.3g]" % (idx, edges[idx], edges[idx + 1]))
+        return {"labels": out, "edges": edges, "bins": bins,
+                "reason": "%d value(s) in %d bin(s)." % (len(vals), bins),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: discretized."}
