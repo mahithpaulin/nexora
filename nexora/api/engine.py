@@ -193,6 +193,17 @@ def _is_file_path(data):
     return isinstance(data, str) and os.path.exists(data) and os.path.isfile(data)
 
 
+def _looks_structured_text(s):
+    """True when a bare string should be parsed, not kept as one label.
+
+    A plain label like "ABC" stays a single observation; text with a
+    comma/newline or starting with "["/"{" is CSV/JSON and goes through
+    parse() so discover("A,B,C") == discover(["A","B","C"]).
+    """
+    t = s.strip()
+    return ("," in s) or ("\n" in s) or t.startswith("[") or t.startswith("{")
+
+
 def _rows(data):
     if isinstance(data, os.PathLike) and _parse_path is not None:
         r = _parse_path(data)  # FileNotFoundError propagates: explicit path must exist
@@ -205,6 +216,17 @@ def _rows(data):
             return []
         except Exception:
             return []
+    # v3 (I10): structured text (CSV/JSON) is parsed element-wise;
+    # a plain string stays one observation (labels may contain no
+    # comma/newline by construction here — match() wraps first anyway).
+    if isinstance(data, str) and _parse_path is not None \
+            and _looks_structured_text(data):
+        try:
+            r = _parse_path(data)
+            if r:
+                return list(r)
+        except Exception:
+            pass
     # v3: every engine method accepts any iterable of observations
     # (list, tuple, range, generator, ...) element-wise. A single scalar
     # or row-dict is wrapped as one observation; bare strings stay single
