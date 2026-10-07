@@ -1212,15 +1212,29 @@ class Nexora:
                 "reason": _r, "explanation": _r,
                 "status": STATUS_NONE, "status_reason": _r}
 
-    def detect(self, data: Any) -> dict:
-        """discover + match in one pass over the data."""
+    def detect(self, data: Any, include_anomalies: bool = False) -> dict:
+        """discover + match in one pass over the data.
+
+        include_anomalies (I21, opt-in): also run find_anomalies and
+        attach {"anomalies", "anomaly_count"} — off by default so the
+        call stays a single mining pass.
+        """
         disc = self.discover(data)
         matches = [m for r in _rows(data) for m in self.match(r)]
         expl = "detect: %d pattern(s), %d match(es) over %d observation(s)." % (disc.get("count", 0), len(matches), len(_rows(data)))
         # WS5: detect reports discover's status (match adds no new claims).
-        return {"patterns": disc.get("patterns", []), "matches": matches, "reason": expl, "explanation": expl, "evidence": disc.get("evidence", {}),
+        out = {"patterns": disc.get("patterns", []), "matches": matches, "reason": expl, "explanation": expl, "evidence": disc.get("evidence", {}),
                 "status": disc.get("status", STATUS_FOUND),
                 "status_reason": "detect: " + str(disc.get("status_reason", disc.get("status", STATUS_FOUND)))}
+        if include_anomalies:
+            try:
+                an = self.find_anomalies(data)
+            except Exception:
+                an = {"anomalies": [], "count": 0, "status": STATUS_NONE}
+            out["anomalies"] = an.get("anomalies", [])
+            out["anomaly_count"] = an.get("count", 0)
+            out["anomaly_status"] = an.get("status", STATUS_NONE)
+        return out
 
     def find_anomalies(self, data: Any, min_severity: str | None = None) -> dict:
         """Flag statistical outliers + novel/missing sequence transitions.
@@ -1566,7 +1580,9 @@ class Nexora:
                 "extrapolation": extrap,
                 "reason": expl, "explanation": expl,
                 "evidence": {"matrix_states": states, "context_query": _ctx_query,
-                             "context_from": _ctx_from},
+                             "context_from": _ctx_from,
+                             # I20: perplexity = 2**log_loss (avg branching).
+                             "perplexity": (2.0 ** log_loss) if isinstance(log_loss, float) else None},
                 "status": _status, "status_reason": _sreason}
 
     def predict_next(self, data: Any, current: Any = None) -> dict:
@@ -2218,6 +2234,81 @@ class Nexora:
         return {"kind": "unknown", "params": {}, "next": [],
                 "confidence": 0.0, "reason": _r, "explanation": _r,
                 "status": STATUS_NONE, "status_reason": _r}
+
+    def compare(self, other: Any) -> dict:
+        """Diff stored patterns vs another engine or pattern list (I22).
+
+        Uses batch.compare_signatures on content fingerprints.
+        Returns {"added", "removed", "common", ...} + status.
+        """
+        if _compare_sigs is None:
+            raise ImportError("nexora.api.batch is required")
+        try:
+            mine = [p for p in self.repo.all() if isinstance(p, dict)]
+        except Exception:
+            mine = []
+        try:
+            theirs = [p for p in other.repo.all() if isinstance(p, dict)] \
+                if hasattr(other, "repo") else list(other or [])
+        except Exception:
+            theirs = []
+        try:
+            diff = _compare_sigs(mine, theirs) or {}
+        except Exception:
+            diff = {}
+        if not isinstance(diff, dict):
+            diff = {}
+        _r = ("Compared %d own vs %d other pattern(s): %d added, %d removed, %d common."
+              % (len(mine), len(theirs), len(diff.get("added", [])),
+                 len(diff.get("removed", [])), len(diff.get("common", []))))
+        return {"added": list(diff.get("added", [])), "removed": list(diff.get("removed", [])),
+                "common": list(diff.get("common", [])),
+                "reason": _r, "explanation": _r, "status": STATUS_FOUND,
+                "status_reason": "FOUND: " + _r}
+
+    def summarize(self) -> dict:
+        """One-dict engine health: memory, stream, config (I23)."""
+        try:
+            all_p = [p for p in self.repo.all() if isinstance(p, dict)]
+        except Exception:
+            all_p = []
+        by_type = collections.Counter(str(p.get("type", "unknown")) for p in all_p)
+        out = {"patterns": len(all_p), "by_type": dict(by_type),
+               "stream_n": self._stream_n,
+               "stream_changes": len(self._stream_changes),
+               "history": len(self._history),
+               "config_keys": len(self.config),
+               "reason": "%d pattern(s), %d streamed." % (len(all_p), self._stream_n),
+               "status": STATUS_FOUND,
+               "status_reason": "FOUND: engine summarized."}
+        return out
+
+    def forget(self, pid: str) -> dict:
+        """Drop one stored pattern by id (I24)."""
+        try:
+            all_ids = {str(p.get("id")) for p in self.repo.all() if isinstance(p, dict)}
+        except Exception:
+            all_ids = set()
+        if str(pid) not in all_ids:
+            _r = "NONE: no pattern '%s' stored." % (pid,)
+            return {"forgotten": False, "reason": _r, "explanation": _r,
+                    "status": STATUS_NONE, "status_reason": _r}
+        try:
+            # Repository has no delete; rebuild without the id.
+            keep = [p for p in self.repo.all()
+                    if isinstance(p, dict) and str(p.get("id")) != str(pid)]
+            fresh = PatternRepository()
+            fresh.import_patterns(keep)
+            self.repo = fresh
+            self._trail.pop(str(pid), None)
+            self._snaps.pop(str(pid), None)
+        except Exception:
+            _r = "NONE: could not forget '%s'." % (pid,)
+            return {"forgotten": False, "reason": _r, "explanation": _r,
+                    "status": STATUS_NONE, "status_reason": _r}
+        _r = "Forgot pattern '%s'." % (pid,)
+        return {"forgotten": True, "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
 
     # ---- v3 analysis wrappers (batch C): additive read-only views. ----
 
