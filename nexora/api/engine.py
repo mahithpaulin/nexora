@@ -1711,6 +1711,9 @@ class Nexora:
 
         Returns {"processed", "total", "stats", "window", "changes"
         (new events this call), "changes_total", "reason"}.
+        Stream rows carry GLOBAL indices: history row ["index"] equals
+        its ["stream_pos"] (0-based over everything streamed so far),
+        so change events and history agree across calls.
         """
         if _RunningStats is None or _SlidingStats is None:
             raise ImportError("nexora.streaming is required")
@@ -1737,6 +1740,18 @@ class Nexora:
         if not cz > 0:
             cz = 6.0
         rows = _rows(data)
+        # v3: global stream positions as row indices. _rows() numbers
+        # per-call (0..n-1); streaming history must not restart at 0 per
+        # chunk, so renumber to base+i == stream_pos before folding.
+        try:
+            _base = int(self._stream_n)
+        except (TypeError, ValueError):
+            _base = 0
+        for _k, _r in enumerate(rows):
+            try:
+                _r["index"] = _base + _k
+            except Exception:
+                pass
         new_changes = []
         for r in rows:
             v = r.get("value")
@@ -1766,7 +1781,8 @@ class Nexora:
                                 score = 1.0 if z in (_math.inf, -_math.inf) else min(1.0, abs(z) / (cz * 2.0))
                                 ev = {"index": r.get("index"), "value": v, "z": z,
                                       "score": score, "kind": "stream_change",
-                                      # index is per-call; stream_pos is global.
+                                      # index and stream_pos are both global
+                                      # (v3: row indices no longer restart).
                                       "stream_pos": self._stream_n,
                                       "causes": ["window mean %.4g vs long-run mean %.4g "
                                                  "(long stdev %.4g, |z|=%.2f >= %.2f)"

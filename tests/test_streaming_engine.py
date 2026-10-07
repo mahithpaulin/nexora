@@ -88,9 +88,10 @@ def test_online_change_detection():
     assert nx.update([])["changes_total"] == 0
     out = nx.update([5.0] * 150)
     assert out["changes"], "sustained 0->5 shift must fire at least once"
-    # stream_pos is global across calls (index restarts per call).
+    # v3: row index and stream_pos are both global across calls.
     first = min(c["stream_pos"] for c in out["changes"])
     assert 150 <= first <= 170
+    assert first == min(c["index"] for c in out["changes"])
     assert all(c["kind"] == "stream_change" for c in out["changes"])
     assert "long-run mean" in out["changes"][0]["explanation"]
     # Bounded: never more than the cap, even on long shifts.

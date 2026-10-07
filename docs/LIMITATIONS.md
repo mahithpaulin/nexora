@@ -53,8 +53,9 @@ before trusting an output.
 - The engine multivariate path embeds the single `value` column in
   windows (a univariate spike test, honestly gated to multi-column
   input); true joint modeling lives in `detect_multivariate` direct use.
-- `update()` row `index` values restart at 0 per call; use `stream_pos`
-  (and history rows) for global positions.
+- v3: stream rows carry global indices — history row `index` equals
+  `stream_pos` (0-based over everything streamed), so change events and
+  history agree across `update()` calls.
 - The perf cache (`cached_dtw`, LRU) is proven for direct DTW use but
   is not wired into `match()`; `match()` ranks by sequence/numeric
   similarity without caching.
