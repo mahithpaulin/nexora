@@ -39,4 +39,6 @@ def test_merge():
     b.discover(list("XYZXYZXYZ"))
     m = a.merge(b)
     assert m["status"] == "FOUND" and m["added"] >= 1
+    same = a.merge(a.export_patterns()["patterns"])
+    assert same["added"] == 0 and same["strengthened"] >= 1
     assert a.merge([])["added"] == 0

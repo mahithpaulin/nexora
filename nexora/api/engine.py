@@ -3988,19 +3988,44 @@ class Nexora:
                 "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
 
     def merge(self, other: Any) -> dict:
-        """Import another engine's (or list's) patterns (I80)."""
+        """Import another engine's (or list's) patterns (I80).
+
+        Routes through the normal store path (signature merge for the
+        same phenomenon, fresh ids otherwise). Foreign occurrence
+        indices are dropped — positions belong to the other dataset —
+        while frequency/confidence merge as one more sighting.
+        """
         try:
             theirs = [p for p in other.repo.all() if isinstance(p, dict)] \
                 if hasattr(other, "repo") else list(other or [])
         except Exception:
             theirs = []
         try:
-            before = self.repo.size()
-            got = self.import_patterns(theirs)
-            added = self.repo.size() - before
-        except Exception as exc:
-            raise ValueError("merge failed: %s" % exc)
-        _r = "Merged %d new pattern(s) (%d offered)." % (added, got.get("imported", 0))
-        return {"added": added, "offered": got.get("imported", 0),
+            before = {str(p.get("id")) for p in self.repo.all() if isinstance(p, dict)}
+        except Exception:
+            before = set()
+        offered, kept = 0, 0
+        for p in theirs:
+            if not isinstance(p, dict):
+                continue
+            offered += 1
+            q = dict(p)
+            q.pop("id", None)
+            q.pop("occurrences", None)
+            q.pop("first_seen", None)
+            q.pop("last_seen", None)
+            try:
+                self._store(q)
+                kept += 1
+            except Exception:
+                continue
+        try:
+            after = {str(p.get("id")) for p in self.repo.all() if isinstance(p, dict)}
+        except Exception:
+            after = before
+        added = len(after - before)
+        _r = "Merged %d new pattern(s), %d strengthened (%d offered)." % (
+            added, kept - added, offered)
+        return {"added": added, "strengthened": kept - added, "offered": offered,
                 "reason": _r, "explanation": _r,
                 "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
