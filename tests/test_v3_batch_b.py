@@ -45,3 +45,17 @@ def test_export_import_roundtrip():
     assert imp["status"] == "FOUND" and imp["imported"] == exp["count"]
     assert b.top_patterns()["count"] == a.top_patterns()["count"]
     assert b.import_patterns([None, 42])["status"] == "NONE"
+
+
+def test_min_severity_filter():
+    import pytest
+    nx = Nexora()
+    data = [10.0] * 30 + [25.0]
+    all_hits = nx.find_anomalies(data)["anomalies"]
+    assert all_hits, "baseline spike must flag"
+    crit = nx.find_anomalies(data, min_severity="critical")
+    assert len(crit["anomalies"]) <= len(all_hits)
+    assert all(a["severity"] == "critical" for a in crit["anomalies"])
+    assert nx.find_anomalies(data, min_severity="low")["count"] == len(all_hits)
+    with pytest.raises(ValueError, match="low/medium/high/critical"):
+        nx.find_anomalies(data, min_severity="extreme")

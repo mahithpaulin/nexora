@@ -1189,8 +1189,13 @@ class Nexora:
                 "status": disc.get("status", STATUS_FOUND),
                 "status_reason": "detect: " + str(disc.get("status_reason", disc.get("status", STATUS_FOUND)))}
 
-    def find_anomalies(self, data: Any) -> dict:
-        """Flag statistical outliers + novel/missing sequence transitions."""
+    def find_anomalies(self, data: Any, min_severity: str | None = None) -> dict:
+        """Flag statistical outliers + novel/missing sequence transitions.
+
+        min_severity (I13): keep only records at/above this level
+        ("low" < "medium" < "high" < "critical"); None keeps all.
+        Unknown levels raise ValueError naming the four.
+        """
         rows = _rows(data)
         st = _stats([r["value"] for r in rows])
         zt = float(self.config.get("z_threshold", 3.0))
@@ -1325,6 +1330,15 @@ class Nexora:
                 pass
         # D3: one event produces one record — merge same-index hits.
         out = _merge_anomalies(out)
+        if min_severity is not None:
+            _rank = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+            if str(min_severity).lower() not in _rank:
+                raise ValueError(
+                    "min_severity must be one of low/medium/high/critical, "
+                    "got %r" % (min_severity,))
+            _cut = _rank[str(min_severity).lower()]
+            out = [a for a in out
+                   if _rank.get(str(a.get("severity", "low")).lower(), 0) >= _cut]
         expl = "Found %d anomalie(s) (z_threshold=%s)." % (len(out), zt)
         if out:
             _status, _sreason = STATUS_FOUND, ("FOUND: %d anomalie(s) in %d observation(s)."
