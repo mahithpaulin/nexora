@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexora"
-version = "1.0.0"
-description = "Nexora Core v0.1 — non-neural, explainable pattern-recognition engine (stdlib only)"
+version = "3.1.0"
+description = "Nexora — non-neural, explainable pattern-recognition engine (stdlib only)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

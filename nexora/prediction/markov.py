@@ -1,5 +1,10 @@
 """First-order Markov chain over discrete labels. Stdlib only, deterministic."""
 
+try:
+    from nexora.prediction.calibration import calibrate as _calibrate
+except ImportError:  # pragma: no cover - package always ships it
+    _calibrate = None
+
 
 def build_transition_matrix(label_seq):
     """Build bigram counts and conditional probs. Returns {states, counts, probs}.
@@ -41,10 +46,22 @@ def predict_next(current, matrix, top_k=3):
     out = []
     for nxt, c in ranked[:max(1, int(top_k))]:
         p = c / total
-        out.append({
+        entry = {
             "next": nxt,
             "probability": p,
             "evidence": ("Observed %d transition(s) '%s'->'%s' out of %d from '%s' (%.1f%%)."
                          % (c, current, nxt, total, current, 100.0 * p)),
-        })
+        }
+        # WS6 calibration: MLE probability unchanged, plus uncertainty.
+        if _calibrate is not None:
+            try:
+                cal = _calibrate(c, total)
+                entry["count"] = cal["count"]
+                entry["total"] = cal["total"]
+                entry["ci95"] = cal["ci95"]
+            except Exception:
+                entry["count"], entry["total"] = c, total
+        else:
+            entry["count"], entry["total"] = c, total
+        out.append(entry)
     return out

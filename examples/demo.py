@@ -1,4 +1,4 @@
-"""Nexora Core v0.1 demo on synthetic data.
+"""Nexora demo on synthetic data.
 
 Shows: (1) discovered patterns, (2) frequencies, (3) confidence,
 (4) observation similarity, (5) anomalies, (6) why each result happened.
@@ -12,7 +12,7 @@ sys.path.insert(0, ".")
 
 from nexora import Nexora
 
-print("=== NEXORA CORE v0.1 DEMO (non-neural, stdlib-only) ===\n")
+print("=== NEXORA DEMO (non-neural, stdlib-only) ===\n")
 
 # --- 1. Repeating categorical pattern with noise + missing value ---
 nx = Nexora(config={"min_support": 2, "max_n": 3, "z_threshold": 3.0})
@@ -45,8 +45,10 @@ vals = [round(10 + (i % 5) * 0.1 - 0.2, 2) for i in range(30)] + [25.0]
 print("\n5. ANOMALIES in 30x~10.0 + [25.0]:")
 anom = nx2.find_anomalies(vals)
 for a in anom["anomalies"]:
+    _z = a.get("z")
+    _zs = ("%.2f" % _z) if isinstance(_z, (int, float)) else "n/a"
     print(f"  index={a['index']} value={a['value']} kind={a['kind']} "
-          f"score={a['score']:.2f} z={a.get('z', 0):.2f}")
+          f"score={a['score']:.2f} z={_zs}")
     print(f"    why: {a['explanation']}")
 
 seq = list("ABCABCABC")

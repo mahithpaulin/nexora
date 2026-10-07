@@ -37,19 +37,28 @@ def find_frequent_sequences(labels, max_n=3, min_support=2) -> list[dict]:
     labels = list(labels)
     out: list[dict] = []
     for n in range(2, max_n + 1):
-        grams = [g for g in ngrams(labels, n)
-                 if not any(_is_missing(t) for t in g)]
         slots = len(labels) - n + 1
-        if slots <= 0 or not grams:
+        if slots <= 0:
             continue
-        counts = Counter(grams)
+        # WS8: single pass builds counts AND positions together, O(slots)
+        # per n (was O(distinct * slots) with a rescan per n-gram).
+        # Positions are original indices (missing n-grams skipped, never
+        # renumbered), so occurrence lists are identical to before.
+        counts: Counter = Counter()
+        positions: dict = {}
+        for i, g in enumerate(ngrams(labels, n)):
+            if any(_is_missing(t) for t in g):
+                continue
+            counts[g] += 1
+            positions.setdefault(g, []).append(i)
+        if not counts:
+            continue
         for gram, cnt in sorted(counts.items(),
                                 key=lambda kv: (-kv[1], n, str(kv[0]))):
             if cnt < min_support:
                 continue
             support = cnt / slots
-            occ = [i for i in range(slots)
-                   if tuple(labels[i: i + n]) == gram]
+            occ = positions[gram]
             out.append({
                 "id": None, "type": "sequential",
                 "features": {"ngram": list(gram), "n": n, "count": cnt,

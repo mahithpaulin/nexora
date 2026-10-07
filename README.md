@@ -1,16 +1,22 @@
-# Nexora v1.0.0 — non-neural pattern-recognition engine
+# Nexora — non-neural pattern-recognition engine
 
-Stdlib-only Python. No neural networks, no numpy, no GPU. Every result
-carries a human-readable explanation with cited numbers.
+Stdlib-only Python (>=3.10). No neural networks, no numpy, no ML
+libraries, no network. Every result carries a human-readable
+explanation with cited numbers, and every result envelope carries an
+explicit status: `FOUND`, `NONE`, `INSUFFICIENT_DATA`, or
+`LOW_CONFIDENCE` (with minimum-data thresholds in config, so nothing
+is fabricated from too little data).
 
 ```python
 from nexora import Nexora
 nx = Nexora()
-print(nx.discover(list("ABCABCABC"))["explanation"])
-print(nx.predict(list("ABCABCABC"))["predictions"])
-print(nx.find_anomalies([10.0] * 30 + [25.0])["anomalies"])
+disc = nx.discover(list("ABCABCABC"))   # closed patterns, significance-vetted
+print(disc["status"], disc["explanation"])
+print(nx.predict(list("ABCABCABC"))["predictions"])   # calibrated + abstains
+print(nx.find_anomalies([10.0] * 30 + [25.0])["anomalies"])  # one record/event
 print(nx.report(nx.detect(list("ABCABC"))))  # markdown report
-nx.save("state.json"); nx.load("state.json")  # persistence
+nx.save("state.json"); nx.load("state.json")  # schema-versioned persistence
+nx.update([1.0, 2.0, 3.0])  # true incremental streaming, bounded memory
 ```
 
 ```bash
@@ -18,65 +24,41 @@ pip install -e .          # or just run from the repo root (stdlib only)
 python -m pytest tests/ -q
 python examples/demo.py           # core story
 python examples/demo_phase2.py    # regimes, correlation, seasonality
+python examples/eval_10.py        # 10 ground-truth problems
+python bench/run_bench.py         # evaluation harness (floors enforced)
+python bench/scaling.py           # scaling benchmark (slope tripwire)
 ```
 
 API: `detect/discover/match/find_anomalies/predict/get_pattern/
-get_history/explain` + `quality/report/save/load/batch`.
+get_history/explain` + `quality/report/save/load/batch` +
+`update/stream_predict/predict_next`.
 Config is validated fail-fast (`InvalidConfigError`, a `ValueError`).
 Details: `pyproject.toml` (`requires-python = >=3.10`, no dependencies).
+Honest limits: `docs/LIMITATIONS.md`. Changes: `CHANGELOG.md`.
 License: MIT (see `LICENSE`).
 
-Opencode bot enabled — comment `/oc` or `/opencode` on any issue or PR to
-get AI help (code, review, research). Runs on GitHub Actions with a free
-Zen model (`opencode/space-bunny-free`).
+What v2 adds over v1: closed-pattern pruning (`show_all=True` to
+opt out), permutation significance vetting (p-value/lift per
+pattern), robust rolling median/MAD anomaly scores + level shifts +
+severity, result statuses, Wilson-calibrated prediction with
+abstention, bounded incremental streaming with online change
+detection, single-pass mining, and the `bench/` harness with
+recorded floors. Old save files still load (migrated automatically).
 
-## Nexora Core v0.1 — non-neural pattern-recognition engine
+What v3 changes over v2 (v3.1.0 — API unchanged, 100 iterations):
+any iterable works wherever a list is shown (tuple/range/generator are
+iterated element-wise, not swallowed as one observation);
+`predict(data, current=X)` conditions both Markov and context backoff on
+`X` (evidence cites `context_query`/`context_from`); `update()` history
+rows carry global `index == stream_pos` across calls. See `CHANGELOG.md`.
 
-Stdlib-only Python. No neural networks, no numpy, no GPU. Every result
-carries a human-readable explanation with cited numbers.
-
-```
-pip install -e .          # or just run from the repo root (stdlib only)
-python -m pytest tests/ -q
-python examples/demo.py
-```
-
-```python
-from nexora import Nexora
-nx = Nexora()
-print(nx.discover(list("ABCABCABC"))["explanation"])
-print(nx.predict(list("ABCABCABC"))["predictions"])
-print(nx.find_anomalies([10.0] * 30 + [25.0])["anomalies"])
-```
-
-Layers: `ingestion → preprocessing (observation) → features
-(statistical/temporal/sequence/structural) → discovery
-(frequency/sequences/change-points) → representation (Pattern) →
-matching (distance/similarity/DTW) → memory (repository/lifecycle) →
-scoring → prediction (Markov/transitions) → explanation → API (Nexora)`.
-See `pyproject.toml` (`requires-python = >=3.10`, no dependencies).
-
-## Phase 2 — discovery & intelligence (v0.2-dev)
-
-New modules, still stdlib-only and deterministic:
-
-- `discovery/clustering.py` — k-means, DBSCAN, agglomerative on
-  windowed embeddings → `regime` patterns wired into `discover()`
-- `features/pca.py` — power-iteration PCA + projection + recon error
-- `features/correlation.py` — covariance/correlation matrices,
-  cross-correlation, `correlation` patterns from multi-field rows
-- `features/seasonality.py` — additive decomposition + autocorr period
-  estimation → `seasonal` patterns wired into `discover()`
-- `prediction/context.py` — variable-order Markov with backoff +
-  sequence log-loss; exposed as `predict()["context"]`
-- `anomaly/multivariate.py` — Mahalanobis detector, also run on
-  windowed 1-D series inside `find_anomalies()` (`kind="multivariate"`)
-- `memory/evolution.py` — snapshots, drift scores, trend tracking;
-  sustained drift flips patterns to `EVOLVING` (lifecycle now persists)
-- `memory/relationships.py` — `commonly_preceded_by/followed_by`
-  attached to sequential patterns on every `discover()`
-
-```bash
-python -m pytest tests/ -q
-python examples/demo_phase2.py
-```
+Architecture: `ingestion → preprocessing (observation) → features
+(statistical/temporal/sequence/structural/correlation/seasonality/PCA)
+→ discovery (frequency/sequences/change-points/clustering/arithmetic/
+significance/pruning) → representation (Pattern) → matching
+(distance/similarity/DTW) → memory (repository/lifecycle/evolution/
+relationships) → scoring → prediction (Markov/context-backoff/
+calibration) → explanation → API (Nexora)`. Streaming stats
+(`nexora/streaming.py`), anomaly detectors (`nexora/anomaly/`), and
+the perf cache (`nexora/perf/`) are stdlib-only and deterministic
+(seeded where randomness is needed).

@@ -1,6 +1,22 @@
 """Statistical + sequence anomaly detection. Stdlib only, deterministic."""
 import math
 
+try:
+    from nexora.anomaly.robust import severity_of as _severity_of
+except ImportError:
+    def _severity_of(score):
+        try:
+            s = float(score)
+        except (TypeError, ValueError):
+            return "low"
+        if s < 0.5:
+            return "low"
+        if s < 0.7:
+            return "medium"
+        if s < 0.9:
+            return "high"
+        return "critical"
+
 
 def _get(p, key, default=None):
     if isinstance(p, dict):
@@ -99,10 +115,13 @@ def detect(values_or_rows, stats=None, z_threshold=3.0, patterns=None):
                     "explanation": ("Statistical outlier at index %s: value %s deviates "
                                     "z=%.2f from mean %.3f (stdev %.3f, threshold %.2f), score %.2f."
                                     % (idx, val, z, mean, stdev, zt, score)),
+                    "severity": _severity_of(score),
                 })
 
-    # Sequence checks over label bigrams.
-    if labels and known_bi:
+    # Sequence checks over label bigrams. Skipped when the series is
+    # constant (a flat series has no novelty by definition — D2) or when
+    # no known bigrams exist. z is None here: no z-score was measured.
+    if labels and known_bi and len(set(labels)) > 1:
         for i in range(len(labels) - 1):
             a, b = labels[i], labels[i + 1]
             if (a, b) in known_bi:
@@ -112,19 +131,21 @@ def detect(values_or_rows, stats=None, z_threshold=3.0, patterns=None):
             if a in expected:
                 exp = sorted(expected[a])
                 out.append({
-                    "index": idx, "value": val, "z": 0.0, "score": 0.55,
+                    "index": idx, "value": val, "z": None, "score": 0.55,
                     "kind": "missing_transition",
                     "causes": ["transition %s->%s never seen; expected one of %s" % (a, b, exp)],
                     "explanation": ("Missing expected transition at index %s: observed %s->%s, "
                                     "but '%s' was previously seen going to %s; score 0.55." % (idx, a, b, a, exp)),
+                    "severity": _severity_of(0.55),
                 })
             else:
                 out.append({
-                    "index": idx, "value": val, "z": 0.0, "score": 0.60,
+                    "index": idx, "value": val, "z": None, "score": 0.60,
                     "kind": "novel_sequence",
                     "causes": ["bigram (%s, %s) unseen in %d known pattern(s)" % (a, b, len(patterns or []))],
                     "explanation": ("Novel sequence at index %s: bigram '%s'->'%s' never appeared in "
                                     "known patterns; score 0.60." % (idx, a, b)),
+                    "severity": _severity_of(0.60),
                 })
     out.sort(key=lambda d: (d["index"], d["kind"]))
     return out

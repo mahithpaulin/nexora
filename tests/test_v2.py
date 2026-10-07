@@ -186,7 +186,13 @@ def test_engine_skipped_evidence():
 def test_engine_structural_evidence():
     disc = Nexora(config={"min_support": 2}).discover(list("ABCABCABC"))
     assert disc["evidence"]["structural"]["nodes"] == 3
-    assoc = [p for p in disc["patterns"] if p["type"] == "association"]
+    # NOTE (v2/WS2): on pure ABC repeats every association rule is
+    # subsumed by the closed ABC pattern with equal support, so none is
+    # stored (D5). A rule that adds information beyond the sequences —
+    # A,B co-occurring across chunks without a frequent AB bigram —
+    # is still stored:
+    disc2 = Nexora(config={"min_support": 2}).discover(list("AXBAYB"))
+    assoc = [p for p in disc2["patterns"] if p["type"] == "association"]
     assert assoc and all(0.0 <= p["confidence"] <= 1.0 for p in assoc)
 
 
@@ -197,8 +203,11 @@ def test_predict_next_sources():
     c = nx.predict_next(list("ABCABCABC"))
     assert c["source"] in ("context", "markov") and c["next"] == "A" and c["probability"] == 1.0
     n = nx.predict_next([])
+    # NOTE (v2/WS5): predict_next now carries an explicit status alongside
+    # the legacy fields (additive, not a behavior change).
     assert n == {"next": None, "probability": 0.0, "source": "none",
-                 "evidence": "no recorded transitions"}
+                 "evidence": "no recorded transitions",
+                 "status": "NONE", "status_reason": "NONE: no recorded transitions."}
     m = build_transition_matrix(["A", "B", "A"])
     assert predict_next("A", m)[0]["next"] == "B"
     cm = build_context_model(list("ABCABC"), max_order=2)
@@ -221,11 +230,16 @@ def test_max_period_respected():
 
 
 def test_multivariate_end_index_flagged():
+    # NOTE (v2/D3): this test previously asserted the buggy behavior —
+    # index 30 reported twice (multivariate z=0.0 + statistical) for a
+    # univariate series. Per D3 a univariate series must not go through
+    # the multivariate detector and one event yields one record.
     out = Nexora().find_anomalies([10.0] * 30 + [25.0])
     idxs = [a["index"] for a in out["anomalies"]]
     assert max(idxs) == 30
-    mv = [a for a in out["anomalies"] if a["kind"] == "multivariate"]
-    assert mv and all(a["index"] == 30 for a in mv)
+    assert idxs == [30]
+    # NOTE (v2/WS4): robust joins statistical in the single merged record.
+    assert "statistical" in out["anomalies"][0]["kind"]
 
 
 def test_quality_still_fine():

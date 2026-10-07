@@ -177,19 +177,22 @@ def test_store_roundtrip_and_migration(tmp_path):
     nx.save(f)
     with open(f) as fh:
         payload = json.load(fh)
-    assert payload["version"] == 1
+    # NOTE (v2/WS10): schema bumped 1 -> 2; save/load intent unchanged
+    # (roundtrip fidelity, v0 loads, future rejected).
+    assert payload["version"] == 2
     nx2 = Nexora()
     info = nx2.load(f)
     assert info["patterns"] == nx.repo.size() > 0
     assert nx2.get_pattern("P-001")["frequency"] == nx.get_pattern("P-001")["frequency"]
-    # v0 migration
+    # v0 migration (normalized to schema v2, provenance in extra).
     v0 = str(tmp_path / "v0.json")
     with open(v0, "w") as fh:
         json.dump({"counter": 2, "patterns": nx.repo.all()}, fh)
     mig = load_engine_state(v0)
-    assert mig["version"] == 0 and mig["trails"] == {}
+    assert mig["version"] == 2 and mig["trails"] == {}
+    assert mig["extra"]["migrated_from"] == 0
     info2 = nx2.load(v0)
-    assert info2["version"] == 0
+    assert info2["version"] == 2
     with pytest.raises(FileNotFoundError):
         load_engine_state(str(tmp_path / "nope.json"))
     fut = str(tmp_path / "fut.json")
@@ -248,7 +251,11 @@ def test_engine_quality_report_batch_prune():
     assert len(outs) == 2
     comp = compare_signatures(outs[0]["result"]["patterns"], outs[1]["result"]["patterns"])
     assert comp["added"] == comp["removed"] == []  # deterministic isolation
-    nx.discover(list("ABCABC"))
+    # NOTE (v2/WS2): closed pruning means plain discover() now stores ~1
+    # pattern here instead of a dozen redundant ones (D5). show_all=True
+    # restores the old unpruned stream so repo.prune() still has >3
+    # patterns to trim — which is what this test is actually about.
+    nx.discover(list("ABCABC"), show_all=True)
     for p in nx.repo.all():
         nx.repo.update(p["id"], {"state": "RETIRED"})
     before = nx.repo.size()

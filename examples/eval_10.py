@@ -58,7 +58,8 @@ check("2 two-level regimes", ok, f"regime means={[round(m, 1) for m in means]} (
 # 3. Spike anomaly ---------------------------------------------------
 d = [round(10 + (i % 5) * 0.2, 1) for i in range(60)] + [100.0]
 out, dt = t(Nexora().find_anomalies, d)
-stat = [a for a in out["anomalies"] if a["kind"] == "statistical"]
+# NOTE (v2/WS4): merged records union detector kinds; `in`, not `==`.
+stat = [a for a in out["anomalies"] if "statistical" in a["kind"]]
 ok = any(a["index"] == 60 for a in stat)
 z = next((a["z"] for a in stat if a["index"] == 60), None)
 check("3 spike anomaly", ok, f"flagged index 60 with z={z:.1f} (expect |z|>>3) ({dt:.2f}s)" if z else "not flagged")

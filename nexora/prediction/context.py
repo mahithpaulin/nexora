@@ -1,6 +1,11 @@
 """Variable-order Markov context model with backoff (stdlib only)."""
 import math
 
+try:
+    from nexora.prediction.calibration import calibrate as _calibrate
+except ImportError:  # pragma: no cover - package always ships it
+    _calibrate = None
+
 
 def _is_missing_label(x):
     """True for None or float NaN (treated as missing, skipped)."""
@@ -75,10 +80,24 @@ def predict_with_context(model: dict, context: list, top_k: int = 3):
             continue
         ranked = sorted(dist.items(),
                         key=lambda kv: (-kv[1], repr(kv[0])))
-        return [{"next": nxt, "probability": c / total, "order": o,
-                 "evidence": f"order {o} context {suffix!r} seen "
-                             f"{total}x: {c}/{total}"}
-                for nxt, c in ranked[:top_k]]
+        out = []
+        for nxt, c in ranked[:top_k]:
+            entry = {"next": nxt, "probability": c / total, "order": o,
+                     "evidence": f"order {o} context {suffix!r} seen "
+                                 f"{total}x: {c}/{total}"}
+            # WS6 calibration: MLE probability unchanged, plus uncertainty.
+            if _calibrate is not None:
+                try:
+                    cal = _calibrate(c, total)
+                    entry["count"] = cal["count"]
+                    entry["total"] = cal["total"]
+                    entry["ci95"] = cal["ci95"]
+                except Exception:
+                    entry["count"], entry["total"] = c, total
+            else:
+                entry["count"], entry["total"] = c, total
+            out.append(entry)
+        return out
     return []
 
 

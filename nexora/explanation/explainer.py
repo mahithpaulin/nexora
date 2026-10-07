@@ -24,16 +24,33 @@ def explain_discovery(pattern):
             % (pid, typ, freq, len(occ), feats, conf_f))
 
 
-def explain_match(obs, pattern_id, similarity, matched_features):
-    """Match rationale citing similarity % and matched feature names."""
+def explain_match(obs, pattern_id, similarity, matched_features, matched=None, threshold=0.5):
+    """Match rationale citing similarity % and matched feature names.
+
+    The text is generated from the actual verdict: matched=True says the
+    observation matched, matched=False says it did not (citing the
+    threshold), matched=None keeps the legacy neutral wording for
+    callers that do not pass a verdict.
+    """
     try:
         sim = float(similarity)
     except (TypeError, ValueError):
         sim = 0.0
+    try:
+        thr = float(threshold)
+    except (TypeError, ValueError):
+        thr = 0.5
     feats = list(matched_features or [])
     val = obs.get("value", obs.get("label")) if isinstance(obs, dict) else obs
-    return ("Observation %s matched pattern %s with similarity %.1f%%; "
-            "matched features: %s." % (val, pattern_id, 100.0 * sim, feats or "none"))
+    if matched is True:
+        return ("Observation %s matched pattern %s with similarity %.1f%%; "
+                "matched features: %s." % (val, pattern_id, 100.0 * sim, feats or "none"))
+    if matched is False:
+        return ("Observation %s did not match pattern %s: similarity %.1f%% is below "
+                "the %.1f%% match threshold; overlapping features: %s."
+                % (val, pattern_id, 100.0 * sim, 100.0 * thr, feats or "none"))
+    return ("Observation %s compared against pattern %s with similarity %.1f%%; "
+            "overlapping features: %s." % (val, pattern_id, 100.0 * sim, feats or "none"))
 
 
 def explain_anomaly(anomaly):
