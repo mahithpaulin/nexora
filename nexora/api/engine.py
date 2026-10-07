@@ -662,6 +662,15 @@ class Nexora:
         None (default) uses the config value.
         max_n (I92): per-call n-gram ceiling (int 2..10); None uses config.
         """
+        if max_n is None:
+            _max_n_ov = None
+        else:
+            try:
+                _max_n_ov = int(max_n)
+            except (TypeError, ValueError):
+                raise ValueError("max_n must be an int in [2, 10]")
+            if _max_n_ov is True or not 2 <= _max_n_ov <= 10:
+                raise ValueError("max_n must be an int in [2, 10]")
         rows = _rows(data)
         values = [r["value"] for r in rows]
         labels = [r["label"] for r in rows]
@@ -748,15 +757,7 @@ class Nexora:
         seqs = []
         if find_frequent_sequences is not None:
             try:
-                if max_n is None:
-                    _max_n = int(self.config.get("max_n", 3))
-                else:
-                    try:
-                        _max_n = int(max_n)
-                    except (TypeError, ValueError):
-                        raise ValueError("max_n must be an int in [2, 10]")
-                    if not 2 <= _max_n <= 10:
-                        raise ValueError("max_n must be an int in [2, 10]")
+                _max_n = _max_n_ov if _max_n_ov is not None else int(self.config.get("max_n", 3))
                 seqs = find_frequent_sequences(labels, _max_n, min_sup) or []
             except Exception:
                 seqs = []
