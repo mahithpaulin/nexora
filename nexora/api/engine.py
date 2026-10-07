@@ -1718,7 +1718,20 @@ class Nexora:
                 "status_reason": "FOUND: history for %s." % pid}
 
     def explain(self, result: Any) -> str:
-        """Human-readable summary of any result dict."""
+        """Human-readable summary of any result dict.
+
+        I51: lists/tuples of results yield numbered one-per-line
+        summaries (first 20), so batch outcomes read clearly.
+        """
+        if isinstance(result, (list, tuple)):
+            parts = []
+            for i, r in enumerate(list(result)[:20]):
+                try:
+                    parts.append("%d. %s" % (i + 1, self.explain(r)))
+                except Exception:
+                    parts.append("%d. %s" % (i + 1, r))
+            extra = "" if len(result) <= 20 else "\n... (%d more)" % (len(result) - 20,)
+            return "\n".join(parts) + extra if parts else "(no results)"
         if summarize_result is not None:
             try:
                 return summarize_result(result)
@@ -3076,3 +3089,127 @@ class Nexora:
                 "reason": "%d value(s) in %d bin(s)." % (len(vals), bins),
                 "status": STATUS_FOUND,
                 "status_reason": "FOUND: discretized."}
+
+    # ---- v3 loop 2, batch J: explanation + data-shape views. ----
+
+    def report_patterns(self, n: int = 5) -> dict:
+        """Markdown dossier of the top-n patterns (I52)."""
+        top = self.top_patterns(n)
+        pats = top.get("patterns", []) if isinstance(top, dict) else []
+        if not pats:
+            _r = "NONE: no patterns stored; run discover() first."
+            return {"markdown": "", "count": 0, "reason": _r,
+                    "explanation": _r, "status": STATUS_NONE,
+                    "status_reason": _r}
+        cards = []
+        for p in pats:
+            try:
+                cards.append(_pattern_card(p) if _pattern_card is not None else str(p))
+            except Exception:
+                cards.append(str(p))
+        md = "\n\n---\n\n".join(cards)
+        return {"markdown": md, "count": len(cards),
+                "reason": "Dossier of %d pattern(s)." % len(cards),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: dossier ready."}
+
+    def anomaly_report(self, data: Any, top_k: int = 5) -> dict:
+        """Markdown list of the top-k anomalies by score (I53)."""
+        try:
+            top_k = max(1, int(top_k))
+        except (TypeError, ValueError):
+            top_k = 5
+        found = self.find_anomalies(data)
+        ans = list(found.get("anomalies", []) or [])
+        ans.sort(key=lambda a: (-float(a.get("score", 0.0) or 0.0),
+                               str(a.get("index", ""))))
+        picked = ans[:top_k]
+        lines = []
+        for a in picked:
+            try:
+                lines.append("- idx %s val %s [%s/%s] score %.2f%s: %s" % (
+                    a.get("index"), a.get("value"), a.get("kind"),
+                    a.get("severity"),
+                    float(a.get("score", 0.0) or 0.0),
+                    (" z=%.2f" % a["z"]) if isinstance(a.get("z"), (int, float)) else "",
+                    a.get("explanation", "")))
+            except Exception:
+                lines.append("- %s" % (a,))
+        md = "\n".join(lines)
+        if picked:
+            return {"markdown": md, "anomalies": picked,
+                    "count": len(picked), "total": len(ans),
+                    "reason": "Top %d of %d anomalie(s)." % (len(picked), len(ans)),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: anomaly report ready."}
+        _r = "NONE: no anomalies to report."
+        return {"markdown": "", "anomalies": [], "count": 0, "total": 0,
+                "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
+
+    def coverage(self, data: Any) -> dict:
+        """Fraction of observations hit by any stored occurrence (I54)."""
+        rows = _rows(data)
+        n = len(rows)
+        if not n:
+            _r = "INSUFFICIENT_DATA: no observations."
+            return {"fraction": 0.0, "covered": 0, "n": 0, "reason": _r,
+                    "explanation": _r, "status": STATUS_INSUFFICIENT,
+                    "status_reason": _r}
+        hit = set()
+        try:
+            all_p = self.repo.all() or []
+        except Exception:
+            all_p = []
+        for p in all_p:
+            try:
+                for o in (p.get("occurrences", []) or []):
+                    if isinstance(o, int) and 0 <= o < n:
+                        hit.add(o)
+            except Exception:
+                continue
+        frac = len(hit) / n
+        _r = "Covered %d of %d (%.1f%%)." % (len(hit), n, 100.0 * frac)
+        return {"fraction": frac, "covered": len(hit), "n": n,
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: " + _r}
+
+    def sampling(self, data: Any, gap_factor: float = 3.0) -> dict:
+        """Timestamp cadence: median dt + gaps > factor x median (I55)."""
+        try:
+            gap_factor = float(gap_factor)
+            if not gap_factor > 0:
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise ValueError("gap_factor must be a number > 0")
+        rows = _rows(data)
+        ts = []
+        for i, r in enumerate(rows):
+            try:
+                t = r.get("timestamp")
+            except Exception:
+                t = None
+            ts.append(t if isinstance(t, (int, float)) and t == t else float(i))
+        if len(ts) < 2:
+            _r = "INSUFFICIENT_DATA: need >= 2 observations."
+            return {"median_dt": None, "gaps": [], "reason": _r,
+                    "explanation": _r, "status": STATUS_INSUFFICIENT,
+                    "status_reason": _r}
+        import statistics as _st
+        dts = [b - a for a, b in zip(ts, ts[1:])]
+        try:
+            med = float(_st.median(dts))
+        except Exception:
+            med = 0.0
+        gaps = [{"after": i, "dt": dt} for i, dt in enumerate(dts)
+                if med > 0 and dt > gap_factor * med]
+        if gaps:
+            _r = "Median dt %.4g; %d gap(s) over %.1fx." % (med, len(gaps), gap_factor)
+            return {"median_dt": med, "gaps": gaps, "reason": _r,
+                    "explanation": _r, "status": STATUS_FOUND,
+                    "status_reason": "FOUND: " + _r}
+        _r = "Even cadence (median dt %.4g, no gaps)." % (med,)
+        return {"median_dt": med, "gaps": [],
+                "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": "NONE: " + _r}
