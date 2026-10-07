@@ -2639,3 +2639,127 @@ class Nexora:
         return {"transitions": [], "distinct": 0,
                 "reason": _r, "explanation": _r,
                 "status": STATUS_NONE, "status_reason": _r}
+
+    # ---- v3 numeric views (batch F): additive read-only wrappers. ----
+
+    def histogram(self, data: Any, bins: int = 10) -> dict:
+        """Equal-width value histogram (I30)."""
+        try:
+            bins = max(1, int(bins))
+        except (TypeError, ValueError):
+            bins = 10
+        vals = self._numeric_values(_rows(data))
+        if not vals:
+            _r = "INSUFFICIENT_DATA: no numeric values for a histogram."
+            return {"bins": [], "n": 0, "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        lo, hi = min(vals), max(vals)
+        width = (hi - lo) / bins if hi > lo else 1.0
+        counts = [0] * bins
+        for v in vals:
+            idx = min(bins - 1, int((v - lo) / width)) if width > 0 else 0
+            counts[idx] += 1
+        table = [{"low": lo + i * width, "high": lo + (i + 1) * width,
+                  "count": c, "fraction": c / len(vals)}
+                 for i, c in enumerate(counts)]
+        return {"bins": table, "n": len(vals), "min": lo, "max": hi,
+                "reason": "%d value(s) in %d bin(s)." % (len(vals), bins),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: histogram over %d value(s)." % len(vals)}
+
+    def zscores(self, data: Any) -> dict:
+        """Per-point z vs the batch mean/pstdev (I31)."""
+        rows = _rows(data)
+        vals = self._numeric_values(rows)
+        if len(vals) < 2:
+            _r = "INSUFFICIENT_DATA: need >= 2 numeric values for z-scores."
+            return {"zscores": [], "n": len(vals), "reason": _r,
+                    "explanation": _r, "status": STATUS_INSUFFICIENT,
+                    "status_reason": _r}
+        import statistics as _st
+        mean = _st.fmean(vals)
+        sd = _st.pstdev(vals)
+        out = []
+        for i, r in enumerate(rows):
+            try:
+                v = r.get("value")
+            except Exception:
+                continue
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v:
+                continue
+            out.append({"index": i, "value": float(v),
+                        "z": ((float(v) - mean) / sd) if sd > 0 else 0.0})
+        return {"zscores": out, "mean": mean, "stdev": sd, "n": len(out),
+                "reason": "%d z-score(s), mean %.4g, stdev %.4g." % (len(out), mean, sd),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: %d z-score(s)." % len(out)}
+
+    def autocorr(self, data: Any, max_lag: int = 10) -> dict:
+        """Autocorrelation {lag: r} for lags 1..max_lag (I32)."""
+        if autocorrelation is None:
+            raise ImportError("nexora.features.temporal is required")
+        try:
+            max_lag = max(1, int(max_lag))
+        except (TypeError, ValueError):
+            max_lag = 10
+        vals = self._numeric_values(_rows(data))
+        if len(vals) < 2:
+            _r = "INSUFFICIENT_DATA: need >= 2 numeric values."
+            return {"lags": {}, "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        try:
+            lags = autocorrelation(vals, max_lag=max_lag) or {}
+        except Exception:
+            lags = {}
+        return {"lags": {int(k): float(v) for k, v in lags.items()},
+                "reason": "Autocorrelation over %d lag(s)." % len(lags),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: %d lag(s)." % len(lags)}
+
+    def moving_average(self, data: Any, window: int | None = None) -> dict:
+        """Trailing moving-average series (I33)."""
+        if moving_average is None:
+            raise ImportError("nexora.features.temporal is required")
+        try:
+            window = max(1, int(window if window is not None
+                                else self.config.get("window", 20)))
+        except (TypeError, ValueError):
+            window = 20
+        vals = self._numeric_values(_rows(data))
+        if not vals:
+            _r = "INSUFFICIENT_DATA: no numeric values."
+            return {"series": [], "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        try:
+            series = moving_average(vals, window=window) or []
+        except Exception:
+            series = []
+        return {"series": list(series), "window": window, "n": len(vals),
+                "reason": "Moving average (window %d) over %d value(s)."
+                          % (window, len(vals)),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: moving average computed."}
+
+    def trend(self, data: Any) -> dict:
+        """Least-squares slope/direction/R^2 (I34)."""
+        if detect_trend is None:
+            raise ImportError("nexora.features.temporal is required")
+        vals = self._numeric_values(_rows(data))
+        if len(vals) < 2:
+            _r = "INSUFFICIENT_DATA: need >= 2 numeric values for a trend."
+            return {"slope": 0.0, "direction": "flat", "strength": 0.0,
+                    "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        try:
+            tr = detect_trend(vals) or {}
+        except Exception:
+            tr = {}
+        if not isinstance(tr, dict):
+            tr = {}
+        _r = "Trend %s (slope %.4g, R^2 %.3f)." % (
+            tr.get("direction", "flat"), tr.get("slope", 0.0), tr.get("r2", tr.get("strength", 0.0)))
+        return {"slope": float(tr.get("slope", 0.0) or 0.0),
+                "direction": str(tr.get("direction", "flat")),
+                "strength": float(tr.get("strength", tr.get("r2", 0.0)) or 0.0),
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
