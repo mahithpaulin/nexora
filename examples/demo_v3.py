@@ -1,4 +1,8 @@
 """Nexora v3 demo: new helpers in one pass (stdlib only, instant)."""
+import sys
+
+sys.path.insert(0, ".")
+
 from nexora import Nexora
 
 nx = Nexora()

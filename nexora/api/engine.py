@@ -2649,13 +2649,14 @@ class Nexora:
                   "fraction": (c / total) if total else 0.0}
                  for k, c in cnt.most_common(top_k)]
         if table:
-            return {"frequencies": table, "distinct": len(cnt), "n": total,
+            return {"frequencies": table, "distinct": len(cnt), "count": len(cnt),
+                    "n": total,
                     "reason": "%d distinct value(s) in %d observation(s)."
                               % (len(cnt), total),
                     "status": STATUS_FOUND,
                     "status_reason": "FOUND: %d distinct value(s)." % len(cnt)}
         _r = "NONE: no countable values."
-        return {"frequencies": [], "distinct": 0, "n": 0,
+        return {"frequencies": [], "distinct": 0, "count": 0, "n": 0,
                 "reason": _r, "explanation": _r,
                 "status": STATUS_NONE, "status_reason": _r}
 
@@ -2676,11 +2677,12 @@ class Nexora:
                  for (a, b), c in pairs.most_common(top_k)]
         if table:
             return {"transitions": table, "distinct": len(pairs),
+                    "count": len(pairs),
                     "reason": "%d distinct transition(s)." % len(pairs),
                     "status": STATUS_FOUND,
                     "status_reason": "FOUND: %d transition(s)." % len(pairs)}
         _r = "NONE: no transitions (need >= 2 labels)."
-        return {"transitions": [], "distinct": 0,
+        return {"transitions": [], "distinct": 0, "count": 0,
                 "reason": _r, "explanation": _r,
                 "status": STATUS_NONE, "status_reason": _r}
 
