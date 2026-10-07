@@ -1873,3 +1873,148 @@ class Nexora:
                 "status": STATUS_FOUND if preds else STATUS_NONE,
                 "status_reason": ("FOUND: stream predictions after '%s'." % cur
                                   if preds else "NONE: no stream transitions from '%s'." % cur)}
+
+    # ---- v3 read-out helpers (I5-I9): additive, no behavior change. ----
+
+    def describe(self, data: Any) -> dict:
+        """Stats + quality snapshot for any iterable (I5).
+
+        Returns {"n", "stats", "quality", "reason", "status", ...}.
+        Never raises on ordinary data.
+        """
+        rows = _rows(data)
+        st = _stats([r["value"] for r in rows])
+        try:
+            q = self.quality([r.get("raw") for r in rows])
+        except Exception:
+            q = {"quality": 0.0, "reason": "quality unavailable"}
+        if not rows:
+            _r = "INSUFFICIENT_DATA: no observations to describe."
+            return {"n": 0, "stats": st, "quality": q, "reason": _r,
+                    "explanation": _r, "status": STATUS_INSUFFICIENT,
+                    "status_reason": _r}
+        _r = "Described %d observation(s)." % len(rows)
+        return {"n": len(rows), "stats": st, "quality": q, "reason": _r,
+                "explanation": _r, "status": STATUS_FOUND,
+                "status_reason": "FOUND: described %d observation(s)." % len(rows)}
+
+    def top_patterns(self, n: int = 5) -> dict:
+        """Top-n stored patterns by confidence (I6)."""
+        try:
+            all_p = [p for p in self.repo.all() if isinstance(p, dict)]
+        except Exception:
+            all_p = []
+        try:
+            n = max(1, int(n))
+        except (TypeError, ValueError):
+            n = 5
+        ranked = sorted(all_p, key=lambda p: (-float(p.get("confidence", 0.0) or 0.0),
+                                              str(p.get("id", ""))))[:n]
+        if ranked:
+            return {"patterns": ranked, "count": len(ranked),
+                    "reason": "Top %d of %d stored pattern(s)." % (len(ranked), len(all_p)),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: %d pattern(s) stored." % len(all_p)}
+        _r = "NONE: no patterns stored yet; run discover() first."
+        return {"patterns": [], "count": 0, "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
+
+    def patterns_by_type(self, ptype: str) -> dict:
+        """Stored patterns of one type, e.g. "seasonal" (I6)."""
+        try:
+            all_p = [p for p in self.repo.all() if isinstance(p, dict)]
+        except Exception:
+            all_p = []
+        hits = [p for p in all_p if str(p.get("type", "")) == str(ptype)]
+        if hits:
+            return {"patterns": hits, "count": len(hits),
+                    "reason": "%d '%s' pattern(s)." % (len(hits), ptype),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: %d '%s' pattern(s)." % (len(hits), ptype)}
+        _r = "NONE: no '%s' patterns stored." % (ptype,)
+        return {"patterns": [], "count": 0, "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
+
+    def stream_stats(self) -> dict:
+        """Current incremental stats without consuming input (I7)."""
+        try:
+            _s = {"n": self._stream_stats.n, "mean": self._stream_stats.mean,
+                  "stdev": self._stream_stats.stdev, "missing": self._stream_stats.missing}
+        except Exception:
+            _s = {"n": 0, "mean": None, "stdev": None, "missing": 0}
+        if self._stream_n:
+            return {"stats": _s, "n": self._stream_n,
+                    "reason": "Stream state after %d observation(s)." % self._stream_n,
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: %d streamed." % self._stream_n}
+        _r = "NONE: nothing streamed yet; call update() first."
+        return {"stats": _s, "n": 0, "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
+
+    def stream_changes(self, limit: int = 20) -> dict:
+        """Retained online change events, newest last (I7)."""
+        try:
+            limit = max(1, int(limit))
+        except (TypeError, ValueError):
+            limit = 20
+        evs = list(self._stream_changes[-limit:])
+        if evs:
+            return {"changes": evs, "count": len(evs), "total": len(self._stream_changes),
+                    "reason": "Showing %d of %d retained change(s)." % (len(evs), len(self._stream_changes)),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: %d change(s) retained." % len(self._stream_changes)}
+        _r = "NONE: no stream changes retained."
+        return {"changes": [], "count": 0, "total": 0, "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
+
+    def pattern_card(self, pid: str) -> dict:
+        """Markdown card for one stored pattern (I8)."""
+        p = self.get_pattern(pid)
+        if not isinstance(p, dict):
+            _r = "NONE: no pattern '%s' stored." % (pid,)
+            return {"card": "", "reason": _r, "explanation": _r,
+                    "status": STATUS_NONE, "status_reason": _r}
+        try:
+            card = _pattern_card(p) if _pattern_card is not None else str(p)
+        except Exception:
+            card = str(p)
+        return {"card": card, "pattern": p,
+                "reason": "Card for %s." % (pid,),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: card for %s." % (pid,)}
+
+    def solve(self, data: Any, steps: int = 1) -> dict:
+        """Closed-form rule for a numeric sequence (I9).
+
+        Wraps discovery.arithmetic: {"kind", "params", "next",
+        "confidence", "explanation"} + status (FOUND vs NONE when the
+        series fits no rule or is too short).
+        """
+        if _analyze_seq is None:
+            raise ImportError("nexora.discovery.arithmetic is required")
+        try:
+            steps = max(1, int(steps))
+        except (TypeError, ValueError):
+            steps = 1
+        vals = [r.get("value") for r in _rows(data)
+                if isinstance(r.get("value"), (int, float)) and not isinstance(r.get("value"), bool)]
+        try:
+            sol = _analyze_seq(vals, steps=steps)
+        except Exception:
+            sol = {"kind": "unknown", "params": {}, "next": [], "confidence": 0.0,
+                   "explanation": "solver errored; no rule."}
+        if not isinstance(sol, dict):
+            sol = {"kind": "unknown", "params": {}, "next": [], "confidence": 0.0,
+                   "explanation": "solver returned nothing usable."}
+        if sol.get("kind") not in (None, "unknown") and sol.get("next"):
+            return {"kind": sol.get("kind"), "params": sol.get("params", {}),
+                    "next": list(sol.get("next") or []),
+                    "confidence": float(sol.get("confidence", 0.0) or 0.0),
+                    "reason": sol.get("explanation", ""),
+                    "explanation": sol.get("explanation", ""),
+                    "status": STATUS_FOUND,
+                    "status_reason": "FOUND: %s rule." % sol.get("kind")}
+        _r = "NONE: no closed-form rule (%s)." % sol.get("explanation", "unknown")
+        return {"kind": "unknown", "params": {}, "next": [],
+                "confidence": 0.0, "reason": _r, "explanation": _r,
+                "status": STATUS_NONE, "status_reason": _r}
