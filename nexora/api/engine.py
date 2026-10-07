@@ -1368,12 +1368,31 @@ class Nexora:
         else:
             cur, preds = current, []
         ctx_preds, log_loss = [], None
+        _ctx_from, _ctx_query = "tail", []
         if build_context_model is not None and labels:
             try:
                 mo = max(0, int(self.config.get("context_order", 2)))
                 clean = [_l for _l in labels if _keep_lab(_l)]
                 self._ctx = build_context_model(clean, mo)
                 tail = clean[-mo:] if mo > 0 else []
+                # v3: an explicit current conditions the context query.
+                # The order-1 field always honored current; the backoff
+                # path used to answer from the data tail even when the
+                # caller asked about a different (possibly never-seen)
+                # symbol. Now the query ends with current — backing off
+                # to lower orders when that context was never seen — so
+                # both fields answer the same question. Restating the
+                # last label changes nothing (tail already ends with it).
+                if current is not None and mo > 0 and _keep_lab(current):
+                    try:
+                        hash(current)
+                        _cur_ok = True
+                    except TypeError:
+                        _cur_ok = False
+                    if _cur_ok and (not tail or tail[-1] != current):
+                        tail = (list(tail) + [current])[-mo:]
+                        _ctx_from = "explicit current"
+                _ctx_query = list(tail)
                 ctx_preds = predict_with_context(self._ctx, tail, top_k=3) or []
                 if sequence_log_loss is not None:
                     try:
@@ -1476,7 +1495,9 @@ class Nexora:
                         % (len(preds), len(ctx_preds), cur, _best_p, _best_tot))
         return {"current": cur, "predictions": preds, "context": ctx_preds, "log_loss": log_loss,
                 "extrapolation": extrap,
-                "reason": expl, "explanation": expl, "evidence": {"matrix_states": states},
+                "reason": expl, "explanation": expl,
+                "evidence": {"matrix_states": states, "context_query": _ctx_query,
+                             "context_from": _ctx_from},
                 "status": _status, "status_reason": _sreason}
 
     def predict_next(self, data: Any, current: Any = None) -> dict:

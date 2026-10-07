@@ -18,9 +18,10 @@ before trusting an output.
   labels) patterns are annotated but never significance-dropped, and
   `discover()` returns `LOW_CONFIDENCE`. Tiny inputs return
   `INSUFFICIENT_DATA` with a reason.
-- `predict()` context backoff answers from the data tail and ignores an
-  explicit `current` the model never saw (pre-existing quirk); the
-  order-1 field honors `current`. Statuses reflect the weaker of the two.
+- v3: `predict(data, current=X)` conditions BOTH the Markov field and
+  the context backoff on `X` (the backoff query ends with `X` and falls
+  back to lower orders when unseen; restating the last label changes
+  nothing). `evidence` cites the query (`context_query`/`context_from`).
 - Wilson intervals are approximations; `abstain_threshold` (0.5) and
   `min_evidence` (2) defaults suit clean symbolic data and may need
   tuning per domain.

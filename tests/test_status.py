@@ -50,8 +50,9 @@ def test_predict_statuses():
     rnd = nx.predict([str(rng.randint(0, 14)) for _ in range(200)])
     assert rnd["status"] == "LOW_CONFIDENCE"
     assert "abstain_threshold" in rnd["status_reason"]
-    # Unknown current: Markov has nothing, context backoff answers from
-    # the tail with a weak top guess -> LOW_CONFIDENCE (honest).
+    # Unknown current: Markov has nothing; context conditions on "ZZZ"
+    # (v3: query ends with the explicit current) and backs off to the
+    # unconditional distribution -> LOW_CONFIDENCE (honest).
     zzz = nx.predict(["A", "B", "C"], current="ZZZ")
     assert zzz["status"] == "LOW_CONFIDENCE"
 
