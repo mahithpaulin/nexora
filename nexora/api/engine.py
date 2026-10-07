@@ -1904,6 +1904,8 @@ class Nexora:
                 _r["index"] = _base + _k
             except Exception:
                 pass
+        import time as _time
+        _t0 = _time.perf_counter()
         new_changes = []
         for r in rows:
             v = r.get("value")
@@ -1989,6 +1991,8 @@ class Nexora:
         return {"processed": len(rows), "total": self._stream_n, "stats": _s,
                 "window": _w, "changes": new_changes,
                 "changes_total": len(self._stream_changes),
+                # I61: wall seconds spent folding this chunk.
+                "elapsed": _time.perf_counter() - _t0,
                 "reason": ("Streamed %d observation(s), %d total; %d new change(s), %d retained."
                            % (len(rows), self._stream_n, len(new_changes),
                               len(self._stream_changes))),
@@ -3407,3 +3411,189 @@ class Nexora:
         return {"labels": [], "distinct": 0, "count": 0, "n": 0,
                 "reason": _r, "explanation": _r,
                 "status": STATUS_NONE, "status_reason": _r}
+
+    # ---- v3 loop 2, batch L: streaming depth. ----
+
+    def stream_describe(self) -> dict:
+        """Stats + window + change counts in one envelope (I62)."""
+        s = self.stream_stats()
+        try:
+            win = {"window": self._stream_window.window, "n": self._stream_window.n,
+                   "mean": self._stream_window.mean, "stdev": self._stream_window.stdev} \
+                if self._stream_window is not None else {"window": 0, "n": 0}
+        except Exception:
+            win = {"window": 0, "n": 0}
+        return {"stats": s.get("stats", {}), "window": win, "n": self._stream_n,
+                "changes_total": len(self._stream_changes),
+                "bigrams": len(self._stream_trans),
+                "reason": "Stream described after %d observation(s)." % self._stream_n,
+                "status": STATUS_FOUND if self._stream_n else STATUS_NONE,
+                "status_reason": ("FOUND: stream described." if self._stream_n
+                                  else "NONE: nothing streamed yet.")}
+
+    def replay(self, data: Any, chunk: int = 1000) -> dict:
+        """reset() then update() in chunks; per-chunk totals (I63)."""
+        try:
+            chunk = max(1, int(chunk))
+        except (TypeError, ValueError):
+            chunk = 1000
+        self.reset()
+        if isinstance(data, dict):
+            raise ValueError("replay() needs an iterable of observations, got a dict")
+        try:
+            seq = list(data) if not isinstance(data, list) else data
+        except TypeError:
+            raise ValueError("replay() needs an iterable of observations")
+        if isinstance(data, (str, bytes)):
+            seq = [data]
+        steps = []
+        for i in range(0, len(seq), chunk):
+            out = self.update(seq[i:i + chunk])
+            steps.append({"chunk": len(steps), "processed": out["processed"],
+                          "total": out["total"],
+                          "new_changes": len(out["changes"])})
+        _r = "Replayed %d observation(s) in %d chunk(s)." % (self._stream_n, len(steps))
+        return {"chunks": steps, "total": self._stream_n,
+                "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND if steps else STATUS_NONE,
+                "status_reason": ("FOUND: " + _r if steps else "NONE: empty input.")}
+
+    @staticmethod
+    def _finite_or_none(x):
+        try:
+            f = float(x)
+            return f if f == f and f not in (float("inf"), float("-inf")) else None
+        except (TypeError, ValueError):
+            return x if isinstance(x, (str, int)) else None
+
+    def stream_checkpoint(self) -> dict:
+        """JSON-safe snapshot of incremental stream state (I64).
+
+        save()/load() persist mined patterns only; the stream model
+        was session-only. checkpoint/restore closes that gap for the
+        running stats, window, transitions, position and retained
+        change events (history rows kept compact, without raw payloads).
+        """
+        if _RunningStats is None or _SlidingStats is None:
+            raise ImportError("nexora.streaming is required")
+        try:
+            rs = {"n": self._stream_stats._n, "mean": self._stream_stats._mean,
+                  "m2": self._stream_stats._m2, "missing": self._stream_stats._missing} \
+                if self._stream_stats is not None else {"n": 0, "mean": 0.0, "m2": 0.0, "missing": 0}
+        except Exception:
+            rs = {"n": 0, "mean": 0.0, "m2": 0.0, "missing": 0}
+        try:
+            w = self._stream_window
+            ws = {"window": w._window, "buf": [self._finite_or_none(v) for v in list(w._buf)],
+                  "sum": w._sum, "sumsq": w._sumsq, "valid": w._valid,
+                  "missing": w._missing} if w is not None else None
+        except Exception:
+            ws = None
+        try:
+            trans = [[[a, b], c] for (a, b), c in self._stream_trans.items()]
+            totals = [[a, c] for a, c in self._stream_totals.items()]
+        except Exception:
+            trans, totals = [], []
+        try:
+            hist = [{"index": r.get("index"), "value": self._finite_or_none(r.get("value")),
+                     "label": (str(r.get("label")) if r.get("label") is not None else None),
+                     "stream_pos": r.get("stream_pos")} for r in self._history]
+        except Exception:
+            hist = []
+        chgs = []
+        for e in self._stream_changes:
+            try:
+                ce = dict(e)
+                for fk in ("z", "score", "value"):
+                    if fk in ce:
+                        ce[fk] = self._finite_or_none(ce[fk])
+                chgs.append(ce)
+            except Exception:
+                continue
+        state = {"v": 1, "n": self._stream_n,
+                 "prev": None if self._stream_prev is _STREAM_UNSET else str(self._stream_prev),
+                 "prev_unset": self._stream_prev is _STREAM_UNSET,
+                 "running": rs, "sliding": ws, "trans": trans, "totals": totals,
+                 "history": hist, "changes": chgs,
+                 "last_change": self._stream_last_change,
+                 "capacity": self._history.maxlen}
+        try:
+            import json as _js
+            _js.dumps(state)
+        except Exception as exc:
+            raise ValueError("checkpoint not serializable: %s" % exc)
+        return {"state": state, "n": self._stream_n,
+                "reason": "Checkpoint at %d observation(s)." % self._stream_n,
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: checkpoint ready."}
+
+    def stream_restore(self, state: dict) -> dict:
+        """Restore stream_checkpoint() state (I64)."""
+        if _RunningStats is None or _SlidingStats is None:
+            raise ImportError("nexora.streaming is required")
+        if not isinstance(state, dict) or state.get("v") != 1:
+            raise ValueError("state must be a stream_checkpoint() v1 dict")
+        import collections as _co
+        try:
+            rs = state.get("running", {}) or {}
+            st = _RunningStats()
+            st._n = int(rs.get("n", 0)); st._mean = float(rs.get("mean", 0.0))
+            st._m2 = float(rs.get("m2", 0.0)); st._missing = int(rs.get("missing", 0))
+            self._stream_stats = st
+            ws = state.get("sliding")
+            if isinstance(ws, dict):
+                w = _SlidingStats(max(1, int(ws.get("window", 20))))
+                import collections as _co2
+                w._buf = _co2.deque(list(ws.get("buf", []) or []), maxlen=w._window)
+                w._sum = float(ws.get("sum", 0.0)); w._sumsq = float(ws.get("sumsq", 0.0))
+                w._valid = int(ws.get("valid", 0)); w._missing = int(ws.get("missing", 0))
+                self._stream_window = w
+            else:
+                self._stream_window = None
+            self._stream_trans = _co.Counter()
+            for pair, c in (state.get("trans", []) or []):
+                try:
+                    self._stream_trans[(pair[0], pair[1])] += int(c)
+                except Exception:
+                    continue
+            self._stream_totals = _co.Counter()
+            for a, c in (state.get("totals", []) or []):
+                try:
+                    self._stream_totals[a] += int(c)
+                except Exception:
+                    continue
+            self._stream_prev = _STREAM_UNSET if state.get("prev_unset", True) else state.get("prev")
+            self._stream_n = int(state.get("n", 0))
+            cap = int(state.get("capacity", 1024) or 1024)
+            self._history = _co.deque(list(state.get("history", []) or []), maxlen=max(1, cap))
+            self._stream_changes = list(state.get("changes", []) or [])
+            self._stream_last_change = state.get("last_change", -10**12)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("bad checkpoint: %s" % exc)
+        _r = "Stream restored at %d observation(s)." % self._stream_n
+        return {"n": self._stream_n, "reason": _r, "explanation": _r,
+                "status": STATUS_FOUND, "status_reason": "FOUND: " + _r}
+
+    def detrend(self, data: Any, window: int | None = None) -> dict:
+        """Residuals vs the trailing moving average (I65)."""
+        if moving_average is None:
+            raise ImportError("nexora.features.temporal is required")
+        try:
+            window = max(1, int(window if window is not None
+                                else self.config.get("window", 20)))
+        except (TypeError, ValueError):
+            window = 20
+        vals = self._numeric_values(_rows(data))
+        if not vals:
+            _r = "INSUFFICIENT_DATA: no numeric values."
+            return {"residuals": [], "reason": _r, "explanation": _r,
+                    "status": STATUS_INSUFFICIENT, "status_reason": _r}
+        try:
+            ma = moving_average(vals, window=window) or []
+        except Exception:
+            ma = []
+        res = [(v - m) if m is not None else None for v, m in zip(vals, ma)]
+        return {"residuals": res, "window": window,
+                "reason": "Detrended %d value(s) (window %d)." % (len(vals), window),
+                "status": STATUS_FOUND,
+                "status_reason": "FOUND: detrended."}
