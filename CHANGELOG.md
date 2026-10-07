@@ -1,5 +1,26 @@
 # Changelog
 
+## v3 (in progress — branch `v3`, PR #3, unreleased)
+
+Clarity + quirk-fix loop on top of 2.0.0. Public API unchanged: every
+change is additive or strictly widens accepted input, so v2 code runs
+as-is. Each item ships with regression tests (`tests/test_v3_*.py`)
+and an updated `docs/LIMITATIONS.md` note.
+
+- I1 ingestion: every entry point (`discover/detect/match/
+  find_anomalies/predict/update/quality/batch`, plus `parse` and
+  `quality_report`) iterates any iterable element-wise — list, tuple,
+  range, generator, .... A bare scalar/row-dict stays one observation,
+  and the `TypeError` names the fix (`wrap a single value as [value]`).
+- I2 prediction: `predict(data, current=X)` conditions BOTH the Markov
+  field and the context backoff on `X` (query ends with `X`, backing
+  off when unseen; restating the last label changes nothing).
+  `evidence` cites the query (`context_query`/`context_from`).
+- I3 streaming: `update()` rows carry global indices — history `index`
+  equals `stream_pos`, so change events and history agree across calls.
+- I4 docs: this section + README notes (changelog grown per
+  iteration; version bump only at release).
+
 ## 2.0.0
 
 Public API unchanged (`detect/discover/match/find_anomalies/predict/

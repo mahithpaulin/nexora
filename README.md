@@ -45,6 +45,13 @@ abstention, bounded incremental streaming with online change
 detection, single-pass mining, and the `bench/` harness with
 recorded floors. Old save files still load (migrated automatically).
 
+What v3 changes over v2 (branch `v3`, PR #3, in progress — API unchanged):
+any iterable works wherever a list is shown (tuple/range/generator are
+iterated element-wise, not swallowed as one observation);
+`predict(data, current=X)` conditions both Markov and context backoff on
+`X` (evidence cites `context_query`/`context_from`); `update()` history
+rows carry global `index == stream_pos` across calls. See `CHANGELOG.md`.
+
 Architecture: `ingestion → preprocessing (observation) → features
 (statistical/temporal/sequence/structural/correlation/seasonality/PCA)
 → discovery (frequency/sequences/change-points/clustering/arithmetic/
